@@ -17,6 +17,7 @@
 #include "hw/virtio/vhost-iova-tree.h"
 #include "hw/virtio/vhost-shadow-virtqueue.h"
 #include "hw/virtio/virtio.h"
+#include "qemu/timer.h"
 #include "standard-headers/linux/vhost_types.h"
 
 /*
@@ -35,6 +36,11 @@ typedef enum SVQTransitionState {
     SVQ_TSTATE_DONE,
     SVQ_TSTATE_ENABLING
 } SVQTransitionState;
+
+typedef enum VioVdpaMode {
+    VIO_VDPA_MODE_SNOOP = 0,
+    VIO_VDPA_MODE_PASSTHROUGH = 1,
+} VioVdpaMode;
 
 /* Info shared by all vhost_vdpa device models */
 typedef struct vhost_vdpa_shared {
@@ -76,6 +82,39 @@ typedef struct vhost_vdpa_shared {
 
     /* SVQ switching is in progress, or already completed? */
     SVQTransitionState svq_switching;
+
+    bool vio_threshold_enabled;
+    bool vio_svq_control_enabled;
+    bool vio_switch_pending;
+    VioVdpaMode vio_mode;
+    uint64_t vio_iops_count;
+    int64_t vio_window_start_ns;
+    int64_t vio_last_switch_ns;
+    int64_t vio_passthrough_enter_ns;
+    uint64_t vio_high_iops;
+    uint64_t vio_low_iops;
+    int64_t vio_window_ns;
+    int64_t vio_cooldown_ns;
+    int64_t vio_passthrough_min_ns;
+    unsigned int vio_passthrough_warmup_windows;
+    unsigned int vio_low_windows_required;
+    unsigned int vio_passthrough_samples;
+    unsigned int vio_low_windows;
+    unsigned int vio_stats_stabilize_windows;
+    unsigned int vio_stats_stabilize_remaining;
+    bool vio_vdpa_baseline_valid;
+    QEMUTimer *vio_sample_timer;
+    VirtIODevice *vio_vdev;
+    char *vio_vdpa_dev;
+    int vio_data_vqs;
+    int vio_vq_size;
+    unsigned int vio_sample_failures;
+    uint64_t vio_last_vdpa_received[VIRTIO_QUEUE_MAX];
+    uint64_t vio_last_vdpa_completed[VIRTIO_QUEUE_MAX];
+    int64_t vio_last_vdpa_sample_ns[VIRTIO_QUEUE_MAX];
+    bool vio_last_vdpa_desc_valid[VIRTIO_QUEUE_MAX];
+    uint16_t vio_last_avail_idx[VIRTIO_QUEUE_MAX];
+    bool vio_last_avail_valid[VIRTIO_QUEUE_MAX];
 } VhostVDPAShared;
 
 typedef struct vhost_vdpa {

@@ -42,7 +42,11 @@ typedef int (*VirtQueueAvailCallback)(VhostShadowVirtqueue *svq,
                                       VirtQueueElement *elem,
                                       void *vq_callback_opaque);
 
+typedef void (*VirtQueueAvailAccountCallback)(VhostShadowVirtqueue *svq,
+                                              void *vq_callback_opaque);
+
 typedef struct VhostShadowVirtqueueOps {
+    VirtQueueAvailAccountCallback avail_account;
     VirtQueueAvailCallback avail_handler;
 } VhostShadowVirtqueueOps;
 

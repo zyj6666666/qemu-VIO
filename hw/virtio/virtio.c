@@ -1582,7 +1582,117 @@ int virtqueue_avail_bytes(VirtQueue *vq, unsigned int in_bytes,
     return in_bytes <= in_total && out_bytes <= out_total;
 }
 
-static bool virtqueue_map_desc(VirtIODevice *vdev, unsigned int *p_num_sg,
+/* 按页遍历轻触，确保触发真实的缺页或缓存加载 */
+static __attribute__((noinline)) void virtio_dma_log_touch(VirtIODevice *vdev,
+                                                           bool is_write,
+                                                           hwaddr gpa,
+                                                           void *hva,
+                                                           hwaddr len)
+{
+    volatile uint8_t touch;
+    hwaddr offset;
+
+    (void)vdev;
+    (void)is_write;
+    (void)gpa;
+
+    if (unlikely(!hva || !len)) {
+        return;
+    }
+
+    /* 以 4096 (4KB页) 为步长遍历整个缓冲区 len */
+    for (offset = 0; offset < len; offset += 4096) {
+        touch = *((volatile uint8_t *)(hva + offset));
+        (void)touch;
+    }
+
+    /* 确保最后一个字节也被摸到 (处理尾部脏页) */
+    if (len % 4096 != 0) {
+        touch = *((volatile uint8_t *)(hva + len - 1));
+        (void)touch;
+    }
+}
+
+static bool virtio_vio_touch_debug_enabled(void)
+{
+    static bool initialized;
+    static bool enabled;
+    const char *value;
+
+    if (initialized) {
+        return enabled;
+    }
+
+    value = g_getenv("VIO_DEBUG_TOUCH");
+    enabled = value && *value &&
+              (g_str_equal(value, "1") ||
+               !g_ascii_strcasecmp(value, "on") ||
+               !g_ascii_strcasecmp(value, "true") ||
+               !g_ascii_strcasecmp(value, "yes"));
+    initialized = true;
+    return enabled;
+}
+
+static void virtio_vio_touch_account(VirtQueue *vq, bool is_write,
+                                     hwaddr len)
+{
+    static uint64_t total_desc;
+    static uint64_t total_bytes;
+    static uint64_t window_desc[VIRTIO_QUEUE_MAX];
+    static uint64_t window_bytes[VIRTIO_QUEUE_MAX];
+    static uint64_t window_in_desc[VIRTIO_QUEUE_MAX];
+    static uint64_t window_out_desc[VIRTIO_QUEUE_MAX];
+    static int64_t last_log_ns;
+    int qidx = virtio_get_queue_index(vq);
+    int64_t now;
+    int i;
+
+    if (!virtio_vio_touch_debug_enabled()) {
+        return;
+    }
+
+    if (qidx < 0 || qidx >= VIRTIO_QUEUE_MAX) {
+        return;
+    }
+
+    total_desc++;
+    total_bytes += len;
+    window_desc[qidx]++;
+    window_bytes[qidx] += len;
+    if (is_write) {
+        window_in_desc[qidx]++;
+    } else {
+        window_out_desc[qidx]++;
+    }
+
+    now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    if (now - last_log_ns < 1000000000LL) {
+        return;
+    }
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "VIO-TOUCH: map_desc total_desc=%" PRIu64
+                  ", total_bytes=%" PRIu64 "\n",
+                  total_desc, total_bytes);
+    for (i = 0; i < VIRTIO_QUEUE_MAX; i++) {
+        if (window_desc[i]) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "VIO-TOUCH: qidx=%d, desc=%" PRIu64
+                          ", in_desc=%" PRIu64 ", out_desc=%" PRIu64
+                          ", bytes=%" PRIu64 "\n",
+                          i, window_desc[i], window_in_desc[i],
+                          window_out_desc[i], window_bytes[i]);
+            window_desc[i] = 0;
+            window_bytes[i] = 0;
+            window_in_desc[i] = 0;
+            window_out_desc[i] = 0;
+        }
+    }
+    last_log_ns = now;
+}
+
+static bool virtqueue_map_desc(VirtQueue *vq, VirtIODevice *vdev,
+                               unsigned int *p_num_sg,
                                hwaddr *addr, struct iovec *iov,
                                unsigned int max_num_sg, bool is_write,
                                hwaddr pa, size_t sz)
@@ -1617,6 +1727,10 @@ static bool virtqueue_map_desc(VirtIODevice *vdev, unsigned int *p_num_sg,
 
         iov[num_sg].iov_len = len;
         addr[num_sg] = pa;
+
+        virtio_dma_log_touch(vdev, is_write, addr[num_sg],
+                             iov[num_sg].iov_base, iov[num_sg].iov_len);
+        virtio_vio_touch_account(vq, is_write, iov[num_sg].iov_len);
 
         sz -= len;
         pa += len;
@@ -1669,6 +1783,9 @@ static void virtqueue_map_iovec(VirtIODevice *vdev, struct iovec *sg,
             error_report("virtio: unexpected memory split");
             exit(1);
         }
+
+        virtio_dma_log_touch(vdev, is_write, addr[i],
+                             sg[i].iov_base, sg[i].iov_len);
     }
 }
 
@@ -1785,7 +1902,7 @@ static void *virtqueue_split_pop(VirtQueue *vq, size_t sz)
         bool map_ok;
 
         if (desc.flags & VRING_DESC_F_WRITE) {
-            map_ok = virtqueue_map_desc(vdev, &in_num, addr + out_num,
+            map_ok = virtqueue_map_desc(vq, vdev, &in_num, addr + out_num,
                                         iov + out_num,
                                         VIRTQUEUE_MAX_SIZE - out_num, true,
                                         desc.addr, desc.len);
@@ -1794,7 +1911,7 @@ static void *virtqueue_split_pop(VirtQueue *vq, size_t sz)
                 virtio_error(vdev, "Incorrect order for descriptors");
                 goto err_undo_map;
             }
-            map_ok = virtqueue_map_desc(vdev, &out_num, addr, iov,
+            map_ok = virtqueue_map_desc(vq, vdev, &out_num, addr, iov,
                                         VIRTQUEUE_MAX_SIZE, false,
                                         desc.addr, desc.len);
         }
@@ -1923,7 +2040,7 @@ static void *virtqueue_packed_pop(VirtQueue *vq, size_t sz)
         bool map_ok;
 
         if (desc.flags & VRING_DESC_F_WRITE) {
-            map_ok = virtqueue_map_desc(vdev, &in_num, addr + out_num,
+            map_ok = virtqueue_map_desc(vq, vdev, &in_num, addr + out_num,
                                         iov + out_num,
                                         VIRTQUEUE_MAX_SIZE - out_num, true,
                                         desc.addr, desc.len);
@@ -1932,7 +2049,7 @@ static void *virtqueue_packed_pop(VirtQueue *vq, size_t sz)
                 virtio_error(vdev, "Incorrect order for descriptors");
                 goto err_undo_map;
             }
-            map_ok = virtqueue_map_desc(vdev, &out_num, addr, iov,
+            map_ok = virtqueue_map_desc(vq, vdev, &out_num, addr, iov,
                                         VIRTQUEUE_MAX_SIZE, false,
                                         desc.addr, desc.len);
         }
@@ -3665,6 +3782,31 @@ hwaddr virtio_queue_get_used_size(VirtIODevice *vdev, int n)
     s = virtio_vdev_has_feature(vdev, VIRTIO_RING_F_EVENT_IDX) ? 2 : 0;
     return offsetof(VRingUsed, ring) +
         sizeof(VRingUsedElem) * vdev->vq[n].vring.num + s;
+}
+
+int virtio_queue_read_avail_idx(VirtIODevice *vdev, int n, uint16_t *idx)
+{
+    VirtQueue *vq = &vdev->vq[n];
+    VRingMemoryRegionCaches *caches;
+    hwaddr pa = offsetof(VRingAvail, idx);
+
+    if (virtio_vdev_has_feature(vdev, VIRTIO_F_RING_PACKED)) {
+        return -ENOTSUP;
+    }
+
+    RCU_READ_LOCK_GUARD();
+
+    if (!vq->vring.avail || !idx) {
+        return -EINVAL;
+    }
+
+    caches = vring_get_region_caches(vq);
+    if (!caches || caches->avail.len < pa + sizeof(uint16_t)) {
+        return -EINVAL;
+    }
+
+    *idx = virtio_lduw_phys_cached(vdev, &caches->avail, pa);
+    return 0;
 }
 
 static unsigned int virtio_queue_packed_get_last_avail_idx(VirtIODevice *vdev,

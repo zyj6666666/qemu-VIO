@@ -31,6 +31,8 @@ int vhost_net_start(VirtIODevice *dev, NetClientState *ncs,
                     int data_queue_pairs, int cvq);
 void vhost_net_stop(VirtIODevice *dev, NetClientState *ncs,
                     int data_queue_pairs, int cvq);
+void vhost_net_stop_force(VirtIODevice *dev, NetClientState *ncs,
+                          int data_queue_pairs, int cvq);
 
 void vhost_net_cleanup(VHostNetState *net);
 

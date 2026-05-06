@@ -18,8 +18,10 @@
 #include "qemu/config-file.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
+#include "qemu/main-loop.h"
 #include "qemu/memalign.h"
 #include "qemu/option.h"
+#include "qemu/timer.h"
 #include "qapi/error.h"
 #include <linux/vhost.h>
 #include <sys/ioctl.h>
@@ -29,6 +31,23 @@
 #include "migration/misc.h"
 #include "hw/virtio/vhost.h"
 #include "trace.h"
+#include <linux/genetlink.h>
+#include <linux/netlink.h>
+#if __has_include(<linux/vdpa.h>)
+#include <linux/vdpa.h>
+#else
+#define VDPA_GENL_NAME "vdpa"
+#define VDPA_GENL_VERSION 0x1
+enum {
+    VDPA_CMD_DEV_VSTATS_GET = 7,
+};
+enum {
+    VDPA_ATTR_DEV_NAME = 4,
+    VDPA_ATTR_DEV_QUEUE_INDEX = 17,
+    VDPA_ATTR_DEV_VENDOR_ATTR_NAME = 18,
+    VDPA_ATTR_DEV_VENDOR_ATTR_VALUE = 19,
+};
+#endif
 
 /* Todo:need to add the multiqueue support here */
 typedef struct VhostVDPAState {
@@ -131,6 +150,512 @@ static const uint64_t vdpa_svq_device_features =
     BIT_ULL(VIRTIO_NET_F_SPEED_DUPLEX);
 
 #define VHOST_VDPA_NET_CVQ_ASID 1
+#define VIO_VDPA_DEFAULT_HIGH_IOPS      95000ULL
+#define VIO_VDPA_DEFAULT_LOW_IOPS       85000ULL
+#define VIO_VDPA_DEFAULT_WINDOW_NS      1000000000LL
+#define VIO_VDPA_DEFAULT_COOLDOWN_NS    3000000000LL
+#define VIO_VDPA_DEFAULT_PASSTHROUGH_MIN_NS 10000000000LL
+#define VIO_VDPA_DEFAULT_WARMUP_WINDOWS 2
+#define VIO_VDPA_DEFAULT_LOW_WINDOWS    3
+#define VIO_VDPA_DEFAULT_STATS_STABILIZE_WINDOWS 2
+#define VIO_VDPA_MAX_SAMPLE_FAILURES    3
+#define VIO_VDPA_STATS_ERR_LOG_LIMIT    8
+
+#ifndef NLA_ALIGNTO
+#define NLA_ALIGNTO 4
+#endif
+#ifndef NLA_ALIGN
+#define NLA_ALIGN(len) (((len) + NLA_ALIGNTO - 1) & ~(NLA_ALIGNTO - 1))
+#endif
+#ifndef NLA_HDRLEN
+#define NLA_HDRLEN ((int) NLA_ALIGN(sizeof(struct nlattr)))
+#endif
+
+static void vhost_vdpa_net_vio_timer_cb(void *opaque);
+static void vhost_vdpa_net_schedule_vio_switch(VhostVDPAState *s);
+
+static uint64_t vio_vdpa_getenv_u64(const char *name, uint64_t defval)
+{
+    const char *value = g_getenv(name);
+    char *endptr = NULL;
+    uint64_t parsed;
+
+    if (!value || !*value) {
+        return defval;
+    }
+
+    parsed = g_ascii_strtoull(value, &endptr, 10);
+    if (endptr == value || *endptr != '\0') {
+        error_report("VIO-VDPA: ignoring invalid %s=%s", name, value);
+        return defval;
+    }
+
+    return parsed;
+}
+
+static bool vio_vdpa_getenv_bool(const char *name, bool defval)
+{
+    const char *value = g_getenv(name);
+
+    if (!value || !*value) {
+        return defval;
+    }
+
+    if (!g_ascii_strcasecmp(value, "1") ||
+        !g_ascii_strcasecmp(value, "on") ||
+        !g_ascii_strcasecmp(value, "true") ||
+        !g_ascii_strcasecmp(value, "yes")) {
+        return true;
+    }
+
+    if (!g_ascii_strcasecmp(value, "0") ||
+        !g_ascii_strcasecmp(value, "off") ||
+        !g_ascii_strcasecmp(value, "false") ||
+        !g_ascii_strcasecmp(value, "no")) {
+        return false;
+    }
+
+    error_report("VIO-VDPA: ignoring invalid %s=%s", name, value);
+    return defval;
+}
+
+static bool vio_vdpa_threshold_env_present(void)
+{
+    return g_getenv("VIO_VDPA_THRESHOLD") ||
+           g_getenv("VIO_HIGH_IOPS") ||
+           g_getenv("VIO_LOW_IOPS") ||
+           g_getenv("VIO_WINDOW_NS") ||
+           g_getenv("VIO_COOLDOWN_NS") ||
+           g_getenv("VIO_PASSTHROUGH_MIN_NS") ||
+           g_getenv("VIO_PASSTHROUGH_WARMUP_WINDOWS") ||
+           g_getenv("VIO_LOW_WINDOWS") ||
+           g_getenv("VIO_STATS_STABILIZE_WINDOWS") ||
+           g_getenv("VIO_VDPA_DEV");
+}
+
+static bool vio_vdpa_debug_enabled(void)
+{
+    return vio_vdpa_getenv_bool("VIO_DEBUG_STATS", false);
+}
+
+static int vio_nl_add_attr(char *buf, size_t buflen, size_t *offset,
+                           int type, const void *data, size_t len)
+{
+    struct nlattr *attr;
+    size_t attr_len = NLA_HDRLEN + len;
+    size_t aligned_len = NLA_ALIGN(attr_len);
+
+    if (*offset + aligned_len > buflen) {
+        return -EMSGSIZE;
+    }
+
+    attr = (struct nlattr *)(buf + *offset);
+    attr->nla_type = type;
+    attr->nla_len = attr_len;
+    memcpy((char *)attr + NLA_HDRLEN, data, len);
+    memset(buf + *offset + attr_len, 0, aligned_len - attr_len);
+    *offset += aligned_len;
+
+    return 0;
+}
+
+static int vio_nl_add_string(char *buf, size_t buflen, size_t *offset,
+                             int type, const char *str)
+{
+    return vio_nl_add_attr(buf, buflen, offset, type, str, strlen(str) + 1);
+}
+
+static int vio_nl_add_u32(char *buf, size_t buflen, size_t *offset,
+                          int type, uint32_t value)
+{
+    return vio_nl_add_attr(buf, buflen, offset, type, &value, sizeof(value));
+}
+
+static bool vio_nl_attr_ok(const struct nlattr *attr, size_t remain)
+{
+    return remain >= sizeof(*attr) &&
+           attr->nla_len >= sizeof(*attr) &&
+           attr->nla_len <= remain;
+}
+
+static int vio_vdpa_netlink_open(void)
+{
+    struct sockaddr_nl addr = {
+        .nl_family = AF_NETLINK,
+    };
+    int fd;
+
+    fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_GENERIC);
+    if (fd < 0) {
+        return -errno;
+    }
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        int ret = -errno;
+
+        close(fd);
+        return ret;
+    }
+
+    return fd;
+}
+
+static int vio_vdpa_netlink_recv_ack(int fd, uint32_t seq, char *buf,
+                                     size_t buflen, ssize_t *received)
+{
+    struct nlmsghdr *nlh;
+    ssize_t len;
+
+    len = recv(fd, buf, buflen, 0);
+    if (len < 0) {
+        return -errno;
+    }
+
+    for (nlh = (struct nlmsghdr *)buf; NLMSG_OK(nlh, len);
+         nlh = NLMSG_NEXT(nlh, len)) {
+        struct nlmsgerr *err;
+
+        if (nlh->nlmsg_seq != seq) {
+            continue;
+        }
+
+        if (nlh->nlmsg_type == NLMSG_ERROR) {
+            err = NLMSG_DATA(nlh);
+            return err->error;
+        }
+
+        *received = (char *)nlh + nlh->nlmsg_len - buf;
+        return 0;
+    }
+
+    return -ENOENT;
+}
+
+static int vio_vdpa_genl_family_id(void)
+{
+    static unsigned int err_logs;
+    struct {
+        struct nlmsghdr nlh;
+        struct genlmsghdr genlh;
+        char attrs[128];
+    } req = {
+        .nlh.nlmsg_type = GENL_ID_CTRL,
+        .nlh.nlmsg_flags = NLM_F_REQUEST,
+        .nlh.nlmsg_seq = 1,
+        .genlh.cmd = CTRL_CMD_GETFAMILY,
+        .genlh.version = 1,
+    };
+    char resp[4096];
+    struct nlmsghdr *nlh;
+    struct genlmsghdr *genlh;
+    struct nlattr *attr;
+    ssize_t received = 0;
+    size_t offset = 0;
+    size_t remain;
+    int fd, ret;
+
+    ret = vio_nl_add_string(req.attrs, sizeof(req.attrs), &offset,
+                            CTRL_ATTR_FAMILY_NAME, VDPA_GENL_NAME);
+    if (ret < 0) {
+        return ret;
+    }
+    req.nlh.nlmsg_len = NLMSG_LENGTH(sizeof(req.genlh)) + offset;
+
+    fd = vio_vdpa_netlink_open();
+    if (fd < 0) {
+        if (err_logs++ < VIO_VDPA_STATS_ERR_LOG_LIMIT) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "VIO-VDPA: stats genl open failed, ret=%d\n", fd);
+        }
+        return fd;
+    }
+
+    if (send(fd, &req, req.nlh.nlmsg_len, 0) < 0) {
+        ret = -errno;
+        if (err_logs++ < VIO_VDPA_STATS_ERR_LOG_LIMIT) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "VIO-VDPA: stats genl family send failed, ret=%d\n",
+                          ret);
+        }
+        goto out;
+    }
+
+    ret = vio_vdpa_netlink_recv_ack(fd, req.nlh.nlmsg_seq, resp,
+                                    sizeof(resp), &received);
+    if (ret < 0) {
+        if (err_logs++ < VIO_VDPA_STATS_ERR_LOG_LIMIT) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "VIO-VDPA: stats genl family recv failed, ret=%d\n",
+                          ret);
+        }
+        goto out;
+    }
+
+    nlh = (struct nlmsghdr *)resp;
+    genlh = NLMSG_DATA(nlh);
+    attr = (struct nlattr *)((char *)genlh + GENL_HDRLEN);
+    remain = nlh->nlmsg_len - NLMSG_LENGTH(GENL_HDRLEN);
+
+    ret = -ENOENT;
+    while (vio_nl_attr_ok(attr, remain)) {
+        if (attr->nla_type == CTRL_ATTR_FAMILY_ID &&
+            attr->nla_len >= NLA_HDRLEN + sizeof(uint16_t)) {
+            uint16_t id;
+
+            memcpy(&id, (char *)attr + NLA_HDRLEN, sizeof(id));
+            ret = id;
+            break;
+        }
+        remain -= NLA_ALIGN(attr->nla_len);
+        attr = (struct nlattr *)((char *)attr + NLA_ALIGN(attr->nla_len));
+    }
+
+out:
+    if (ret < 0 && err_logs++ < VIO_VDPA_STATS_ERR_LOG_LIMIT) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "VIO-VDPA: stats genl family lookup failed, ret=%d\n",
+                      ret);
+    } else if (ret > 0 && vio_vdpa_debug_enabled()) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "VIO-VDPA: stats genl family id=%d\n", ret);
+    }
+    close(fd);
+    return ret;
+}
+
+static int vio_vdpa_query_queue_stats(const char *dev_name, int qidx,
+                                      uint64_t *received_desc,
+                                      uint64_t *completed_desc)
+{
+    static int family_id;
+    static unsigned int err_logs;
+    struct {
+        struct nlmsghdr nlh;
+        struct genlmsghdr genlh;
+        char attrs[256];
+    } req = {
+        .nlh.nlmsg_flags = NLM_F_REQUEST,
+        .nlh.nlmsg_seq = 2,
+        .genlh.cmd = VDPA_CMD_DEV_VSTATS_GET,
+        .genlh.version = VDPA_GENL_VERSION,
+    };
+    char resp[8192];
+    struct nlmsghdr *nlh;
+    struct genlmsghdr *genlh;
+    struct nlattr *attr;
+    ssize_t received = 0;
+    size_t offset = 0;
+    size_t remain;
+    char last_name[64] = "";
+    bool found = false;
+    int fd, ret;
+
+    if (family_id <= 0) {
+        family_id = vio_vdpa_genl_family_id();
+        if (family_id < 0) {
+            ret = family_id;
+            family_id = 0;
+            if (err_logs++ < VIO_VDPA_STATS_ERR_LOG_LIMIT) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "VIO-VDPA: stats qidx=%d family lookup failed, "
+                              "dev=%s, ret=%d\n",
+                              qidx, dev_name, ret);
+            }
+            return ret;
+        }
+    }
+
+    ret = vio_nl_add_string(req.attrs, sizeof(req.attrs), &offset,
+                            VDPA_ATTR_DEV_NAME, dev_name);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = vio_nl_add_u32(req.attrs, sizeof(req.attrs), &offset,
+                         VDPA_ATTR_DEV_QUEUE_INDEX, qidx);
+    if (ret < 0) {
+        return ret;
+    }
+
+    req.nlh.nlmsg_type = family_id;
+    req.nlh.nlmsg_len = NLMSG_LENGTH(sizeof(req.genlh)) + offset;
+
+    fd = vio_vdpa_netlink_open();
+    if (fd < 0) {
+        if (err_logs++ < VIO_VDPA_STATS_ERR_LOG_LIMIT) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "VIO-VDPA: stats qidx=%d open failed, dev=%s, "
+                          "ret=%d\n",
+                          qidx, dev_name, fd);
+        }
+        return fd;
+    }
+
+    if (send(fd, &req, req.nlh.nlmsg_len, 0) < 0) {
+        ret = -errno;
+        if (err_logs++ < VIO_VDPA_STATS_ERR_LOG_LIMIT) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "VIO-VDPA: stats qidx=%d send failed, dev=%s, "
+                          "ret=%d\n",
+                          qidx, dev_name, ret);
+        }
+        goto out;
+    }
+
+    ret = vio_vdpa_netlink_recv_ack(fd, req.nlh.nlmsg_seq, resp,
+                                    sizeof(resp), &received);
+    if (ret < 0) {
+        if (err_logs++ < VIO_VDPA_STATS_ERR_LOG_LIMIT) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "VIO-VDPA: stats qidx=%d recv failed, dev=%s, "
+                          "ret=%d\n",
+                          qidx, dev_name, ret);
+        }
+        goto out;
+    }
+
+    *received_desc = 0;
+    *completed_desc = 0;
+    nlh = (struct nlmsghdr *)resp;
+    genlh = NLMSG_DATA(nlh);
+    attr = (struct nlattr *)((char *)genlh + GENL_HDRLEN);
+    remain = nlh->nlmsg_len - NLMSG_LENGTH(GENL_HDRLEN);
+
+    while (vio_nl_attr_ok(attr, remain)) {
+        void *data = (char *)attr + NLA_HDRLEN;
+        size_t data_len = attr->nla_len - NLA_HDRLEN;
+
+        if (attr->nla_type == VDPA_ATTR_DEV_VENDOR_ATTR_NAME && data_len) {
+            size_t len = MIN(data_len, sizeof(last_name) - 1);
+
+            memcpy(last_name, data, len);
+            last_name[len] = '\0';
+        } else if (attr->nla_type == VDPA_ATTR_DEV_VENDOR_ATTR_VALUE &&
+                   data_len >= sizeof(uint64_t)) {
+            uint64_t value;
+
+            memcpy(&value, data, sizeof(value));
+            if (!strcmp(last_name, "received_desc")) {
+                *received_desc = value;
+                found = true;
+            } else if (!strcmp(last_name, "completed_desc")) {
+                *completed_desc = value;
+                found = true;
+            }
+        }
+
+        remain -= NLA_ALIGN(attr->nla_len);
+        attr = (struct nlattr *)((char *)attr + NLA_ALIGN(attr->nla_len));
+    }
+
+    ret = found ? 0 : -ENOENT;
+
+out:
+    if (ret == 0 && vio_vdpa_debug_enabled()) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "VIO-VDPA: stats qidx=%d raw, dev=%s, "
+                      "received=%" PRIu64 ", completed=%" PRIu64 "\n",
+                      qidx, dev_name, *received_desc, *completed_desc);
+    } else if (ret < 0 && err_logs++ < VIO_VDPA_STATS_ERR_LOG_LIMIT) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "VIO-VDPA: stats qidx=%d query failed, dev=%s, ret=%d, "
+                      "found=%d, last_attr=%s\n",
+                      qidx, dev_name, ret, found, last_name);
+    }
+    close(fd);
+    return ret;
+}
+
+static char *vio_vdpa_dev_name_from_path(const char *vhostdev)
+{
+    const char *prefix = "/dev/vhost-vdpa-";
+    const char *idx;
+    char *endptr = NULL;
+    unsigned long parsed;
+
+    if (!vhostdev || !g_str_has_prefix(vhostdev, prefix)) {
+        return NULL;
+    }
+
+    idx = vhostdev + strlen(prefix);
+    parsed = g_ascii_strtoull(idx, &endptr, 10);
+    if (endptr == idx || *endptr != '\0') {
+        return NULL;
+    }
+
+    return g_strdup_printf("vdpa%lu", parsed);
+}
+
+static void vio_vdpa_shared_init(VhostVDPAState *s, bool start_with_svq)
+{
+    VhostVDPAShared *shared = s->vhost_vdpa.shared;
+    bool threshold_default = start_with_svq ||
+                             vio_vdpa_threshold_env_present();
+
+    shared->vio_threshold_enabled =
+        vio_vdpa_getenv_bool("VIO_VDPA_THRESHOLD", threshold_default);
+    shared->vio_svq_control_enabled = start_with_svq;
+    shared->vio_switch_pending = false;
+    shared->vio_mode = VIO_VDPA_MODE_SNOOP;
+    shared->vio_iops_count = 0;
+    shared->vio_window_start_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    shared->vio_last_switch_ns = 0;
+    shared->vio_passthrough_enter_ns = 0;
+    shared->vio_high_iops = vio_vdpa_getenv_u64("VIO_HIGH_IOPS",
+                                                VIO_VDPA_DEFAULT_HIGH_IOPS);
+    shared->vio_low_iops = vio_vdpa_getenv_u64("VIO_LOW_IOPS",
+                                               VIO_VDPA_DEFAULT_LOW_IOPS);
+    shared->vio_window_ns = vio_vdpa_getenv_u64("VIO_WINDOW_NS",
+                                                VIO_VDPA_DEFAULT_WINDOW_NS);
+    shared->vio_cooldown_ns = vio_vdpa_getenv_u64("VIO_COOLDOWN_NS",
+                                                  VIO_VDPA_DEFAULT_COOLDOWN_NS);
+    shared->vio_passthrough_min_ns =
+        vio_vdpa_getenv_u64("VIO_PASSTHROUGH_MIN_NS",
+                            VIO_VDPA_DEFAULT_PASSTHROUGH_MIN_NS);
+    shared->vio_passthrough_warmup_windows =
+        vio_vdpa_getenv_u64("VIO_PASSTHROUGH_WARMUP_WINDOWS",
+                            VIO_VDPA_DEFAULT_WARMUP_WINDOWS);
+    shared->vio_low_windows_required =
+        vio_vdpa_getenv_u64("VIO_LOW_WINDOWS",
+                            VIO_VDPA_DEFAULT_LOW_WINDOWS);
+    shared->vio_stats_stabilize_windows =
+        vio_vdpa_getenv_u64("VIO_STATS_STABILIZE_WINDOWS",
+                            VIO_VDPA_DEFAULT_STATS_STABILIZE_WINDOWS);
+    shared->vio_stats_stabilize_remaining = 0;
+    shared->vio_vdpa_baseline_valid = false;
+    shared->vio_passthrough_samples = 0;
+    shared->vio_low_windows = 0;
+    shared->vio_vdev = NULL;
+    shared->vio_vdpa_dev = g_strdup(g_getenv("VIO_VDPA_DEV"));
+    shared->vio_data_vqs = 0;
+    shared->vio_vq_size = 0;
+    shared->vio_sample_failures = 0;
+
+    if (shared->vio_low_iops > shared->vio_high_iops) {
+        error_report("VIO-VDPA: VIO_LOW_IOPS must be <= VIO_HIGH_IOPS; "
+                     "using defaults");
+        shared->vio_high_iops = VIO_VDPA_DEFAULT_HIGH_IOPS;
+        shared->vio_low_iops = VIO_VDPA_DEFAULT_LOW_IOPS;
+    }
+
+    if (!shared->vio_window_ns) {
+        shared->vio_window_ns = VIO_VDPA_DEFAULT_WINDOW_NS;
+    }
+    if (!shared->vio_passthrough_min_ns) {
+        shared->vio_passthrough_min_ns = VIO_VDPA_DEFAULT_PASSTHROUGH_MIN_NS;
+    }
+    if (!shared->vio_low_windows_required) {
+        shared->vio_low_windows_required = 1;
+    }
+
+    shared->vio_sample_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
+                                           vhost_vdpa_net_vio_timer_cb, s);
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "VIO-VDPA: threshold=%d, svq_control=%d, initial_mode=%s\n",
+                  shared->vio_threshold_enabled,
+                  shared->vio_svq_control_enabled,
+                  shared->vio_mode == VIO_VDPA_MODE_SNOOP ?
+                  "SNOOP" : "PASSTHROUGH");
+}
 
 static struct vhost_net *vhost_vdpa_get_vhost_net(NetClientState *nc)
 {
@@ -239,6 +764,11 @@ static void vhost_vdpa_cleanup(NetClientState *nc)
     if (s->vhost_vdpa.index != 0) {
         return;
     }
+    if (s->vhost_vdpa.shared->vio_sample_timer) {
+        timer_free(s->vhost_vdpa.shared->vio_sample_timer);
+        s->vhost_vdpa.shared->vio_sample_timer = NULL;
+    }
+    g_free(s->vhost_vdpa.shared->vio_vdpa_dev);
     qemu_close(s->vhost_vdpa.shared->device_fd);
     g_clear_pointer(&s->vhost_vdpa.shared->iova_tree, vhost_iova_tree_delete);
     g_free(s->vhost_vdpa.shared);
@@ -356,6 +886,17 @@ static void vhost_vdpa_net_log_global_enable(VhostVDPAState *s, bool enable)
     data_queue_pairs = n->multiqueue ? n->max_queue_pairs : 1;
     cvq = virtio_vdev_has_feature(vdev, VIRTIO_NET_F_CTRL_VQ) ?
                                   n->max_ncs - n->max_queue_pairs : 0;
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "VIO-VDPA: switch queue state, target=%s, enable_svq=%d, "
+                  "multiqueue=%d, max_queue_pairs=%u, curr_queue_pairs=%u, "
+                  "max_ncs=%d, data_queue_pairs=%d, cvq=%d, "
+                  "shadow_vqs_enabled=%d, always_svq=%d, "
+                  "vhost_started=%d\n",
+                  enable ? "SNOOP" : "PASSTHROUGH", enable,
+                  n->multiqueue, n->max_queue_pairs, n->curr_queue_pairs,
+                  n->max_ncs, data_queue_pairs, cvq,
+                  s->vhost_vdpa.shadow_vqs_enabled, s->always_svq,
+                  n->vhost_started);
     v->shared->svq_switching = enable ?
         SVQ_TSTATE_ENABLING : SVQ_TSTATE_DISABLING;
     /*
@@ -363,7 +904,10 @@ static void vhost_vdpa_net_log_global_enable(VhostVDPAState *s, bool enable)
      * in the future and resume the device if read-only operations between
      * suspend and reset goes wrong.
      */
-    vhost_net_stop(vdev, n->nic->ncs, data_queue_pairs, cvq);
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "VIO-VDPA: force stop vhost net for dynamic switch, "
+                  "skip_get_vring_base=1\n");
+    vhost_net_stop_force(vdev, n->nic->ncs, data_queue_pairs, cvq);
 
     /* Start will check migration setup_or_active to configure or not SVQ */
     r = vhost_net_start(vdev, n->nic->ncs, data_queue_pairs, cvq);
@@ -372,6 +916,603 @@ static void vhost_vdpa_net_log_global_enable(VhostVDPAState *s, bool enable)
     }
     v->shared->svq_switching = SVQ_TSTATE_DONE;
 }
+
+static int vhost_vdpa_net_data_vqs(VhostVDPAState *s)
+{
+    VhostVDPAShared *shared = s->vhost_vdpa.shared;
+    VirtIODevice *vdev;
+    VirtIONet *n;
+    int data_queue_pairs;
+
+    if (!shared->vio_vdev && s->vhost_vdpa.dev && s->vhost_vdpa.dev->vdev) {
+        shared->vio_vdev = s->vhost_vdpa.dev->vdev;
+    }
+
+    if (!shared->vio_vdev) {
+        return 0;
+    }
+
+    vdev = shared->vio_vdev;
+    n = VIRTIO_NET(vdev);
+    data_queue_pairs = n->multiqueue ? n->max_queue_pairs : 1;
+    shared->vio_data_vqs = data_queue_pairs * 2;
+    shared->vio_vq_size = virtio_queue_get_num(vdev, 0);
+
+    return shared->vio_data_vqs;
+}
+
+static void vhost_vdpa_net_vio_reset_avail_sample(VhostVDPAState *s)
+{
+    VhostVDPAShared *shared = s->vhost_vdpa.shared;
+    VirtIODevice *vdev;
+    int data_vqs = vhost_vdpa_net_data_vqs(s);
+    int i;
+
+    vdev = shared->vio_vdev;
+
+    if (!vdev || data_vqs <= 0) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "VIO-VDPA: avail sample reset unavailable, "
+                      "vdev=%p, data_vqs=%d, vdpa_dev=%s\n",
+                      vdev, data_vqs,
+                      shared->vio_vdpa_dev ? shared->vio_vdpa_dev : "(null)");
+        return;
+    }
+
+    memset(shared->vio_last_avail_valid, 0,
+           sizeof(shared->vio_last_avail_valid));
+    shared->vio_sample_failures = 0;
+
+    for (i = 0; i < data_vqs; i++) {
+        uint16_t idx;
+        int ret;
+
+        ret = virtio_queue_read_avail_idx(vdev, i, &idx);
+        if (ret == 0) {
+            shared->vio_last_avail_idx[i] = idx;
+            shared->vio_last_avail_valid[i] = true;
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "VIO-VDPA: avail sample reset qidx=%d, idx=%u\n",
+                          i, idx);
+        } else {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "VIO-VDPA: avail sample reset qidx=%d failed, "
+                          "ret=%d\n", i, ret);
+        }
+    }
+
+    shared->vio_window_start_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+}
+
+static void vhost_vdpa_net_vio_begin_vdpa_sample(VhostVDPAState *s)
+{
+    VhostVDPAShared *shared = s->vhost_vdpa.shared;
+    int data_vqs = vhost_vdpa_net_data_vqs(s);
+
+    memset(shared->vio_last_vdpa_desc_valid, 0,
+           sizeof(shared->vio_last_vdpa_desc_valid));
+    memset(shared->vio_last_vdpa_sample_ns, 0,
+           sizeof(shared->vio_last_vdpa_sample_ns));
+    shared->vio_sample_failures = 0;
+    shared->vio_vdpa_baseline_valid = false;
+    shared->vio_stats_stabilize_remaining =
+        shared->vio_stats_stabilize_windows;
+
+    if (!shared->vio_vdpa_dev || data_vqs <= 0) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "VIO-VDPA: vdpa stats begin unavailable, "
+                      "dev=%s, data_vqs=%d\n",
+                      shared->vio_vdpa_dev ? shared->vio_vdpa_dev : "(null)",
+                      data_vqs);
+        shared->vio_window_start_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        return;
+    }
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "VIO-VDPA: vdpa stats begin, dev=%s, data_vqs=%d, "
+                  "decision_grace_windows=%u\n",
+                  shared->vio_vdpa_dev, data_vqs,
+                  shared->vio_stats_stabilize_remaining);
+    shared->vio_window_start_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+}
+
+static uint64_t vhost_vdpa_net_vio_counter_delta(VhostVDPAShared *shared,
+                                                 uint64_t now,
+                                                 uint64_t old)
+{
+    if (now >= old) {
+        return now - old;
+    }
+
+    if (shared->vio_vq_size > 0) {
+        return (now + shared->vio_vq_size - old % shared->vio_vq_size) %
+               shared->vio_vq_size;
+    }
+
+    return 0;
+}
+
+static bool vhost_vdpa_net_vio_sample_vdpa_stats(VhostVDPAState *s,
+                                                 uint64_t *iops,
+                                                 bool *not_ready)
+{
+    VhostVDPAShared *shared = s->vhost_vdpa.shared;
+    int data_vqs = vhost_vdpa_net_data_vqs(s);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    int64_t elapsed = now - shared->vio_window_start_ns;
+    uint64_t iops_sum = 0;
+    bool sampled = false;
+    int i;
+
+    *not_ready = false;
+
+    if (!shared->vio_vdpa_dev || data_vqs <= 0 || elapsed <= 0) {
+        return false;
+    }
+
+    if (!shared->vio_vdpa_baseline_valid) {
+        bool baseline_ready = false;
+
+        for (i = 0; i < data_vqs; i++) {
+            uint64_t received_desc, completed_desc;
+            int ret;
+
+            ret = vio_vdpa_query_queue_stats(shared->vio_vdpa_dev, i,
+                                             &received_desc, &completed_desc);
+            if (ret != 0) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "VIO-VDPA: vdpa stats baseline qidx=%d failed, "
+                              "ret=%d, decision_grace_remaining=%u\n",
+                              i, ret, shared->vio_stats_stabilize_remaining);
+                continue;
+            }
+
+            baseline_ready = true;
+            shared->vio_last_vdpa_received[i] = received_desc;
+            shared->vio_last_vdpa_completed[i] = completed_desc;
+            shared->vio_last_vdpa_sample_ns[i] = now;
+            shared->vio_last_vdpa_desc_valid[i] = true;
+
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "VIO-VDPA: vdpa stats baseline qidx=%d, "
+                          "received=%" PRIu64 ", completed=%" PRIu64
+                          ", decision_grace_remaining=%u\n",
+                          i, received_desc, completed_desc,
+                          shared->vio_stats_stabilize_remaining);
+        }
+
+        if (!baseline_ready) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "VIO-VDPA: vdpa stats baseline no readable queues, "
+                          "dev=%s\n", shared->vio_vdpa_dev);
+            return false;
+        }
+
+        shared->vio_window_start_ns = now;
+        *not_ready = true;
+        shared->vio_vdpa_baseline_valid = true;
+        shared->vio_sample_failures = 0;
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "VIO-VDPA: vdpa stats baseline established immediately, "
+                      "dev=%s, data_vqs=%d, decision_grace_windows=%u\n",
+                      shared->vio_vdpa_dev, data_vqs,
+                      shared->vio_stats_stabilize_remaining);
+        return false;
+    }
+
+    for (i = 0; i < data_vqs; i++) {
+        uint64_t received_desc, completed_desc;
+        uint64_t old_received, old_completed;
+        uint64_t received_delta = 0, completed_delta = 0, delta = 0;
+        int64_t old_sample_ns, q_elapsed;
+        uint64_t q_iops = 0;
+        bool counter_reset = false;
+        bool old_valid;
+        int ret;
+
+        old_received = shared->vio_last_vdpa_received[i];
+        old_completed = shared->vio_last_vdpa_completed[i];
+        old_sample_ns = shared->vio_last_vdpa_sample_ns[i];
+        old_valid = shared->vio_last_vdpa_desc_valid[i];
+        ret = vio_vdpa_query_queue_stats(shared->vio_vdpa_dev, i,
+                                         &received_desc, &completed_desc);
+        if (ret != 0) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "VIO-VDPA: vdpa stats sample qidx=%d failed, "
+                          "ret=%d, old_valid=%d, old_received=%" PRIu64
+                          ", old_completed=%" PRIu64
+                          ", keep_previous_baseline=1\n",
+                          i, ret, old_valid, old_received, old_completed);
+            continue;
+        }
+
+        q_elapsed = now - old_sample_ns;
+        if (old_valid && q_elapsed > 0) {
+            counter_reset =
+                (received_desc < old_received &&
+                 old_received > shared->vio_vq_size) ||
+                (completed_desc < old_completed &&
+                 old_completed > shared->vio_vq_size);
+            if (!counter_reset) {
+                received_delta = vhost_vdpa_net_vio_counter_delta(
+                    shared, received_desc, old_received);
+                completed_delta = vhost_vdpa_net_vio_counter_delta(
+                    shared, completed_desc, old_completed);
+                delta = MAX(received_delta, completed_delta);
+                q_iops = delta * 1000000000ULL / q_elapsed;
+                iops_sum += q_iops;
+                sampled = true;
+            }
+        }
+
+        shared->vio_last_vdpa_received[i] = received_desc;
+        shared->vio_last_vdpa_completed[i] = completed_desc;
+        shared->vio_last_vdpa_sample_ns[i] = now;
+        shared->vio_last_vdpa_desc_valid[i] = true;
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "VIO-VDPA: vdpa stats sample qidx=%d, "
+                      "received=%" PRIu64 ", completed=%" PRIu64
+                      ", old_valid=%d, old_received=%" PRIu64
+                      ", old_completed=%" PRIu64
+                      ", received_delta=%" PRIu64
+                      ", completed_delta=%" PRIu64
+                      ", delta=%" PRIu64 ", q_elapsed=%" PRId64
+                      ", q_iops=%" PRIu64 ", counter_reset=%d"
+                      ", vq_size=%d\n",
+                      i, received_desc, completed_desc, old_valid,
+                      old_received, old_completed, received_delta,
+                      completed_delta, delta, q_elapsed, q_iops,
+                      counter_reset, shared->vio_vq_size);
+    }
+
+    shared->vio_window_start_ns = now;
+
+    if (!sampled) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "VIO-VDPA: vdpa stats sample has no valid baseline, "
+                      "dev=%s, data_vqs=%d, elapsed=%" PRId64 "\n",
+                      shared->vio_vdpa_dev, data_vqs, elapsed);
+        return false;
+    }
+
+    shared->vio_sample_failures = 0;
+    *iops = iops_sum;
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "VIO-VDPA: vdpa stats sample, iops=%" PRIu64
+                  ", elapsed=%" PRId64 "\n", *iops, elapsed);
+    return true;
+}
+
+static bool vhost_vdpa_net_vio_sample_passthrough(VhostVDPAState *s,
+                                                  uint64_t *iops)
+{
+    VhostVDPAShared *shared = s->vhost_vdpa.shared;
+    VirtIODevice *vdev;
+    int data_vqs = vhost_vdpa_net_data_vqs(s);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    int64_t elapsed = now - shared->vio_window_start_ns;
+    uint64_t requests = 0;
+    bool sampled = false;
+    int i;
+
+    vdev = shared->vio_vdev;
+
+    if (!vdev || data_vqs <= 0 || elapsed <= 0) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "VIO-VDPA: avail sample unavailable before query, "
+                      "vdev=%p, data_vqs=%d, elapsed=%" PRId64 "\n",
+                      vdev, data_vqs, elapsed);
+        return false;
+    }
+
+    for (i = 0; i < data_vqs; i++) {
+        uint16_t idx;
+        uint16_t old_idx = shared->vio_last_avail_idx[i];
+        bool old_valid = shared->vio_last_avail_valid[i];
+        int ret;
+
+        ret = virtio_queue_read_avail_idx(vdev, i, &idx);
+        if (ret != 0) {
+            shared->vio_last_avail_valid[i] = false;
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "VIO-VDPA: avail sample qidx=%d failed, ret=%d, "
+                          "old_valid=%d, old=%u\n",
+                          i, ret, old_valid, old_idx);
+            continue;
+        }
+
+        if (old_valid) {
+            uint16_t delta = idx - old_idx;
+
+            requests += delta;
+            sampled = true;
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "VIO-VDPA: avail sample qidx=%d, idx=%u, "
+                          "old=%u, delta=%u\n",
+                          i, idx, old_idx, delta);
+        } else {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "VIO-VDPA: avail sample qidx=%d, idx=%u, "
+                          "old_valid=0\n", i, idx);
+        }
+
+        shared->vio_last_avail_idx[i] = idx;
+        shared->vio_last_avail_valid[i] = true;
+    }
+
+    shared->vio_window_start_ns = now;
+
+    if (!sampled) {
+        return false;
+    }
+
+    shared->vio_sample_failures = 0;
+    *iops = requests * 1000000000ULL / elapsed;
+    return true;
+}
+
+static void vhost_vdpa_net_vio_timer_cb(void *opaque)
+{
+    VhostVDPAState *s = opaque;
+    VhostVDPAShared *shared = s->vhost_vdpa.shared;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    uint64_t iops = 0;
+    bool stats_not_ready = false;
+    bool stats_sampled;
+
+    if (!shared->vio_threshold_enabled) {
+        return;
+    }
+
+    if (shared->vio_switch_pending) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "VIO-VDPA: applying switch, target=%s, "
+                      "vdpa_dev=%s, data_vqs=%d, vdev=%p\n",
+                      shared->vio_mode == VIO_VDPA_MODE_SNOOP ?
+                      "SNOOP" : "PASSTHROUGH",
+                      shared->vio_vdpa_dev ? shared->vio_vdpa_dev : "(null)",
+                      shared->vio_data_vqs, shared->vio_vdev);
+        if (shared->vio_svq_control_enabled) {
+            vhost_vdpa_net_log_global_enable(
+                s, shared->vio_mode == VIO_VDPA_MODE_SNOOP);
+        } else {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "VIO-VDPA: stats-only mode, skip SVQ switch, "
+                          "logical_target=%s\n",
+                          shared->vio_mode == VIO_VDPA_MODE_SNOOP ?
+                          "SNOOP" : "PASSTHROUGH");
+        }
+        shared->vio_switch_pending = false;
+        if (shared->vio_mode == VIO_VDPA_MODE_PASSTHROUGH) {
+            vhost_vdpa_net_vio_begin_vdpa_sample(s);
+            if (!shared->vio_vdpa_dev) {
+                vhost_vdpa_net_vio_reset_avail_sample(s);
+            }
+            timer_mod(shared->vio_sample_timer, now + shared->vio_window_ns);
+        }
+        return;
+    }
+
+    if (shared->vio_mode != VIO_VDPA_MODE_PASSTHROUGH &&
+        shared->vio_svq_control_enabled) {
+        return;
+    }
+
+    stats_sampled = vhost_vdpa_net_vio_sample_vdpa_stats(s, &iops,
+                                                         &stats_not_ready);
+    if (!stats_sampled && stats_not_ready) {
+        timer_mod(shared->vio_sample_timer, now + shared->vio_window_ns);
+        return;
+    }
+
+    if (!stats_sampled && !shared->vio_svq_control_enabled) {
+        shared->vio_sample_failures++;
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "VIO-VDPA: stats-only %s sample unavailable, "
+                      "failures=%u/%u, keep current mode and skip decision\n",
+                      shared->vio_mode == VIO_VDPA_MODE_SNOOP ?
+                      "SNOOP" : "PASSTHROUGH",
+                      shared->vio_sample_failures,
+                      VIO_VDPA_MAX_SAMPLE_FAILURES);
+        timer_mod(shared->vio_sample_timer, now + shared->vio_window_ns);
+        return;
+    }
+
+    if (!stats_sampled &&
+        !vhost_vdpa_net_vio_sample_passthrough(s, &iops)) {
+        shared->vio_sample_failures++;
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "VIO-VDPA: %s sample unavailable, "
+                      "failures=%u/%u, keep current mode and skip decision\n",
+                      shared->vio_mode == VIO_VDPA_MODE_SNOOP ?
+                      "stats-only SNOOP" : "passthrough",
+                      shared->vio_sample_failures,
+                      VIO_VDPA_MAX_SAMPLE_FAILURES);
+        timer_mod(shared->vio_sample_timer, now + shared->vio_window_ns);
+        return;
+    }
+
+    if (!shared->vio_svq_control_enabled &&
+        shared->vio_mode == VIO_VDPA_MODE_SNOOP) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "VIO-VDPA: stats-only SNOOP sample, iops=%" PRIu64
+                      ", high=%" PRIu64 ", low=%" PRIu64 "\n",
+                      iops, shared->vio_high_iops, shared->vio_low_iops);
+        if (iops >= shared->vio_high_iops &&
+            now - shared->vio_last_switch_ns >= shared->vio_cooldown_ns) {
+            shared->vio_mode = VIO_VDPA_MODE_PASSTHROUGH;
+            shared->vio_last_switch_ns = now;
+            shared->vio_passthrough_enter_ns = now;
+            shared->vio_iops_count = 0;
+            shared->vio_sample_failures = 0;
+            shared->vio_passthrough_samples = 0;
+            shared->vio_low_windows = 0;
+            shared->vio_stats_stabilize_remaining = 0;
+            vhost_vdpa_net_vio_begin_vdpa_sample(s);
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "VIO-VDPA: logical switch SNOOP -> PASSTHROUGH, "
+                          "iops=%" PRIu64
+                          ", svq_control=0, backend_path_unchanged=1\n",
+                          iops);
+        } else {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "VIO-VDPA: stay stats-only SNOOP, iops=%" PRIu64
+                          ", high=%" PRIu64 "\n",
+                          iops, shared->vio_high_iops);
+        }
+        timer_mod(shared->vio_sample_timer, now + shared->vio_window_ns);
+        return;
+    }
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "VIO-VDPA: passthrough sample result, iops=%" PRIu64
+                  ", low=%" PRIu64 ", elapsed_since_switch=%" PRId64 "\n",
+                  iops, shared->vio_low_iops,
+                  now - shared->vio_last_switch_ns);
+
+    shared->vio_passthrough_samples++;
+
+    if (shared->vio_stats_stabilize_remaining > 0) {
+        shared->vio_stats_stabilize_remaining--;
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "VIO-VDPA: keep PASSTHROUGH for stats decision grace, "
+                      "remaining=%u, samples=%u, iops=%" PRIu64 "\n",
+                      shared->vio_stats_stabilize_remaining,
+                      shared->vio_passthrough_samples, iops);
+        timer_mod(shared->vio_sample_timer, now + shared->vio_window_ns);
+        return;
+    }
+
+    if (shared->vio_passthrough_samples <=
+        shared->vio_passthrough_warmup_windows ||
+        now - shared->vio_passthrough_enter_ns <
+        shared->vio_passthrough_min_ns) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "VIO-VDPA: keep PASSTHROUGH for warmup/residency, "
+                      "samples=%u/%u, low_windows=%u/%u, residency=%" PRId64
+                      "/%" PRId64 "\n",
+                      shared->vio_passthrough_samples,
+                      shared->vio_passthrough_warmup_windows,
+                      shared->vio_low_windows,
+                      shared->vio_low_windows_required,
+                      now - shared->vio_passthrough_enter_ns,
+                      shared->vio_passthrough_min_ns);
+        timer_mod(shared->vio_sample_timer, now + shared->vio_window_ns);
+        return;
+    }
+
+    if (iops <= shared->vio_low_iops) {
+        shared->vio_low_windows++;
+    } else {
+        shared->vio_low_windows = 0;
+    }
+
+    if (iops <= shared->vio_low_iops &&
+        shared->vio_low_windows >= shared->vio_low_windows_required &&
+        now - shared->vio_last_switch_ns >= shared->vio_cooldown_ns) {
+        shared->vio_mode = VIO_VDPA_MODE_SNOOP;
+        shared->vio_last_switch_ns = now;
+        shared->vio_iops_count = 0;
+        shared->vio_window_start_ns = now;
+        shared->vio_sample_failures = 0;
+        shared->vio_passthrough_samples = 0;
+        shared->vio_low_windows = 0;
+        shared->vio_vdpa_baseline_valid = false;
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "VIO-VDPA: switch PASSTHROUGH -> SNOOP, "
+                      "iops=%" PRIu64 ", low_windows=%u/%u\n",
+                      iops, shared->vio_low_windows_required,
+                      shared->vio_low_windows_required);
+        if (shared->vio_svq_control_enabled) {
+            vhost_vdpa_net_schedule_vio_switch(s);
+        } else {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "VIO-VDPA: logical switch PASSTHROUGH -> SNOOP, "
+                          "backend_path_unchanged=1, svq_control=0\n");
+            timer_mod(shared->vio_sample_timer, now + shared->vio_window_ns);
+        }
+        return;
+    }
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "VIO-VDPA: stay PASSTHROUGH, iops=%" PRIu64
+                  ", low=%" PRIu64 ", low_windows=%u/%u\n",
+                  iops, shared->vio_low_iops, shared->vio_low_windows,
+                  shared->vio_low_windows_required);
+    timer_mod(shared->vio_sample_timer, now + shared->vio_window_ns);
+}
+
+static void vhost_vdpa_net_schedule_vio_switch(VhostVDPAState *s)
+{
+    VhostVDPAShared *shared = s->vhost_vdpa.shared;
+
+    if (shared->vio_switch_pending) {
+        return;
+    }
+
+    shared->vio_switch_pending = true;
+    timer_mod(shared->vio_sample_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + shared->vio_window_ns);
+}
+
+static void vhost_vdpa_net_data_svq_account(VhostShadowVirtqueue *svq,
+                                            void *opaque)
+{
+    VhostVDPAState *s = opaque;
+    VhostVDPAState *s0 = vhost_vdpa_net_first_nc_vdpa(s);
+    VhostVDPAShared *shared = s0->vhost_vdpa.shared;
+    int64_t now, elapsed;
+    uint64_t iops;
+
+    (void)svq;
+
+    if (!shared->vio_threshold_enabled ||
+        !shared->vio_svq_control_enabled ||
+        shared->vio_mode != VIO_VDPA_MODE_SNOOP) {
+        return;
+    }
+
+    now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    elapsed = now - shared->vio_window_start_ns;
+    shared->vio_iops_count++;
+
+    if (elapsed < shared->vio_window_ns) {
+        return;
+    }
+
+    iops = shared->vio_iops_count * 1000000000ULL / elapsed;
+
+    if (iops >= shared->vio_high_iops &&
+        now - shared->vio_last_switch_ns >= shared->vio_cooldown_ns) {
+        shared->vio_mode = VIO_VDPA_MODE_PASSTHROUGH;
+        shared->vio_last_switch_ns = now;
+        shared->vio_passthrough_enter_ns = now;
+        shared->vio_iops_count = 0;
+        shared->vio_window_start_ns = now;
+        shared->vio_sample_failures = 0;
+        shared->vio_passthrough_samples = 0;
+        shared->vio_low_windows = 0;
+        shared->vio_vdpa_baseline_valid = false;
+        shared->vio_stats_stabilize_remaining =
+            shared->vio_stats_stabilize_windows;
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "VIO-VDPA: switch SNOOP -> PASSTHROUGH, "
+                      "iops=%" PRIu64 "\n", iops);
+        vhost_vdpa_net_schedule_vio_switch(s0);
+        return;
+    }
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "VIO-VDPA: stay SNOOP, iops=%" PRIu64
+                  ", low=%" PRIu64 ", high=%" PRIu64 "\n",
+                  iops, shared->vio_low_iops, shared->vio_high_iops);
+    shared->vio_iops_count = 0;
+    shared->vio_window_start_ns = now;
+}
+
+static const VhostShadowVirtqueueOps vhost_vdpa_net_data_svq_ops = {
+    .avail_account = vhost_vdpa_net_data_svq_account,
+};
 
 static int vdpa_net_migration_state_notifier(NotifierWithReturn *notifier,
                                              MigrationEvent *e, Error **errp)
@@ -399,14 +1540,32 @@ static int vhost_vdpa_net_data_start(NetClientState *nc)
 
     assert(nc->info->type == NET_CLIENT_DRIVER_VHOST_VDPA);
 
-    if (s->always_svq || migration_is_running()) {
+    if (v->shared->vio_threshold_enabled &&
+        v->shared->vio_svq_control_enabled) {
+        v->shadow_vqs_enabled =
+            migration_is_running() || v->shared->vio_mode == VIO_VDPA_MODE_SNOOP;
+    } else if (s->always_svq || migration_is_running()) {
         v->shadow_vqs_enabled = true;
     } else {
         v->shadow_vqs_enabled = false;
     }
 
     if (v->index == 0) {
+        v->shared->vio_vdev = v->dev ? v->dev->vdev : NULL;
+        v->shared->vio_data_vqs = vhost_vdpa_net_data_vqs(s);
         v->shared->shadow_data = v->shadow_vqs_enabled;
+        if (v->shared->vio_threshold_enabled &&
+            (!v->shared->vio_svq_control_enabled ||
+             v->shared->vio_mode == VIO_VDPA_MODE_PASSTHROUGH) &&
+            !v->shared->vio_switch_pending) {
+            vhost_vdpa_net_vio_begin_vdpa_sample(s);
+            if (!v->shared->vio_vdpa_dev) {
+                vhost_vdpa_net_vio_reset_avail_sample(s);
+            }
+            timer_mod(v->shared->vio_sample_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                      v->shared->vio_window_ns);
+        }
         vhost_vdpa_net_data_start_first(s);
         return 0;
     }
@@ -1687,6 +2846,7 @@ static NetClientState *net_vhost_vdpa_init(NetClientState *peer,
                                        struct vhost_vdpa_iova_range iova_range,
                                        uint64_t features,
                                        VhostVDPAShared *shared,
+                                       const char *vhostdev,
                                        Error **errp)
 {
     NetClientState *nc = NULL;
@@ -1725,6 +2885,28 @@ static NetClientState *net_vhost_vdpa_init(NetClientState *peer,
         s->vhost_vdpa.shared->shadow_data = svq;
         s->vhost_vdpa.shared->iova_tree = vhost_iova_tree_new(iova_range.first,
                                                               iova_range.last);
+        vio_vdpa_shared_init(s, svq);
+        if (!s->vhost_vdpa.shared->vio_vdpa_dev && vhostdev) {
+            s->vhost_vdpa.shared->vio_vdpa_dev =
+                vio_vdpa_dev_name_from_path(vhostdev);
+        }
+        if (s->vhost_vdpa.shared->vio_vdpa_dev) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "VIO-VDPA: using vDPA stats device %s\n",
+                          s->vhost_vdpa.shared->vio_vdpa_dev);
+        } else {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "VIO-VDPA: no vDPA stats device; "
+                          "set VIO_VDPA_DEV=vdpaX to enable stats sampling\n");
+        }
+        if (s->vhost_vdpa.shared->vio_threshold_enabled &&
+            !s->vhost_vdpa.shared->vio_svq_control_enabled) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "VIO-VDPA: stats-only threshold mode without SVQ; "
+                          "IOPS comes from vDPA stats; SNOOP/PASSTHROUGH "
+                          "are logical modes and the backend path is not "
+                          "restarted\n");
+        }
     } else if (!is_datapath) {
         s->cvq_cmd_out_buffer = mmap(NULL, vhost_vdpa_net_cvq_cmd_page_len(),
                                      PROT_READ | PROT_WRITE,
@@ -1739,6 +2921,10 @@ static NetClientState *net_vhost_vdpa_init(NetClientState *peer,
     }
     if (queue_pair_index != 0) {
         s->vhost_vdpa.shared = shared;
+    }
+    if (is_datapath) {
+        s->vhost_vdpa.shadow_vq_ops = &vhost_vdpa_net_data_svq_ops;
+        s->vhost_vdpa.shadow_vq_ops_opaque = s;
     }
 
     ret = vhost_vdpa_add(nc, (void *)&s->vhost_vdpa, queue_pair_index, nvqs);
@@ -1865,7 +3051,8 @@ int net_init_vhost_vdpa(const Netdev *netdev, const char *name,
         }
         ncs[i] = net_vhost_vdpa_init(peer, TYPE_VHOST_VDPA, name,
                                      vdpa_device_fd, i, 2, true, opts->x_svq,
-                                     iova_range, features, shared, errp);
+                                     iova_range, features, shared,
+                                     opts->vhostdev, errp);
         if (!ncs[i])
             goto err;
     }
@@ -1877,7 +3064,7 @@ int net_init_vhost_vdpa(const Netdev *netdev, const char *name,
         nc = net_vhost_vdpa_init(peer, TYPE_VHOST_VDPA, name,
                                  vdpa_device_fd, i, 1, false,
                                  opts->x_svq, iova_range, features, shared,
-                                 errp);
+                                 opts->vhostdev, errp);
         if (!nc)
             goto err;
     }

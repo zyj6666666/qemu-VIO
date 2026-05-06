@@ -1382,17 +1382,56 @@ static int do_vhost_virtqueue_stop(struct vhost_dev *dev,
     struct vhost_vring_state state = {
         .index = vhost_vq_index,
     };
+    hwaddr desc_addr = virtio_queue_get_desc_addr(vdev, idx);
+    hwaddr avail_addr = virtio_queue_get_avail_addr(vdev, idx);
+    hwaddr used_addr = virtio_queue_get_used_addr(vdev, idx);
+    unsigned int last_avail_idx = virtio_queue_get_last_avail_idx(vdev, idx);
     int r = 0;
 
-    if (virtio_queue_get_desc_addr(vdev, idx) == 0) {
+    if (desc_addr == 0) {
         /* Don't stop the virtqueue which might have not been started */
+        VHOST_OPS_DEBUG(0,
+                        "vhost VQ %u skip stop: desc_addr=0, "
+                        "vhost_vq_index=%d, dev_vq_index=%d, "
+                        "dev_nvqs=%u, dev_vq_index_end=%d, force=%d",
+                        idx, vhost_vq_index, dev->vq_index, dev->nvqs,
+                        dev->vq_index_end, force);
         return 0;
     }
 
     if (!force) {
         r = dev->vhost_ops->vhost_get_vring_base(dev, &state);
         if (r < 0) {
-            VHOST_OPS_DEBUG(r, "vhost VQ %u ring restore failed: %d", idx, r);
+            VHOST_OPS_DEBUG(r,
+                            "vhost VQ %u ring restore failed: %d, "
+                            "vhost_vq_index=%d, state_index=%u, "
+                            "state_num=%u, dev_vq_index=%d, dev_nvqs=%u, "
+                            "dev_vq_index_end=%d, force=%d, "
+                            "desc_addr=0x%" PRIx64 ", "
+                            "avail_addr=0x%" PRIx64 ", "
+                            "used_addr=0x%" PRIx64 ", "
+                            "desc_size=0x%" PRIx64 ", "
+                            "avail_size=0x%" PRIx64 ", "
+                            "used_size=0x%" PRIx64 ", "
+                            "last_avail_idx=%u",
+                            idx, r, vhost_vq_index, state.index, state.num,
+                            dev->vq_index, dev->nvqs, dev->vq_index_end,
+                            force, (uint64_t)desc_addr, (uint64_t)avail_addr,
+                            (uint64_t)used_addr,
+                            (uint64_t)virtio_queue_get_desc_size(vdev, idx),
+                            (uint64_t)virtio_queue_get_avail_size(vdev, idx),
+                            (uint64_t)virtio_queue_get_used_size(vdev, idx),
+                            last_avail_idx);
+        } else {
+            VHOST_OPS_DEBUG(0,
+                            "vhost VQ %u ring restore ok: "
+                            "vhost_vq_index=%d, state_num=%u, "
+                            "dev_vq_index=%d, dev_nvqs=%u, "
+                            "dev_vq_index_end=%d, force=%d, "
+                            "last_avail_idx=%u",
+                            idx, vhost_vq_index, state.num, dev->vq_index,
+                            dev->nvqs, dev->vq_index_end, force,
+                            last_avail_idx);
         }
     }
 

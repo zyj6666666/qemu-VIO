@@ -337,7 +337,11 @@ static void vhost_handle_guest_kick(VhostShadowVirtqueue *svq)
                 break;
             }
 
-            if (svq->ops) {
+            if (svq->ops && svq->ops->avail_account) {
+                svq->ops->avail_account(svq, svq->ops_opaque);
+            }
+
+            if (svq->ops && svq->ops->avail_handler) {
                 r = svq->ops->avail_handler(svq, elem, svq->ops_opaque);
             } else {
                 r = vhost_svq_add_element(svq, elem);

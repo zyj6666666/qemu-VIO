@@ -389,8 +389,9 @@ fail_start:
     return r;
 }
 
-static void vhost_net_stop_one(struct vhost_net *net,
-                               VirtIODevice *dev)
+static void vhost_net_stop_one_common(struct vhost_net *net,
+                                      VirtIODevice *dev,
+                                      bool force)
 {
     struct vhost_vring_file file = { .fd = -1 };
 
@@ -403,11 +404,30 @@ static void vhost_net_stop_one(struct vhost_net *net,
     if (net->nc->info->poll) {
         net->nc->info->poll(net->nc, true);
     }
-    vhost_dev_stop(&net->dev, dev, false);
+    if (force) {
+        vhost_dev_force_stop(&net->dev, dev, false);
+    } else {
+        vhost_dev_stop(&net->dev, dev, false);
+    }
     if (net->nc->info->stop) {
         net->nc->info->stop(net->nc);
     }
 }
+
+static void vhost_net_stop_one(struct vhost_net *net,
+                               VirtIODevice *dev)
+{
+    vhost_net_stop_one_common(net, dev, false);
+}
+
+static void vhost_net_stop_one_force(struct vhost_net *net,
+                                     VirtIODevice *dev)
+{
+    vhost_net_stop_one_common(net, dev, true);
+}
+
+static void vhost_net_stop_common(VirtIODevice *dev, NetClientState *ncs,
+                                  int data_queue_pairs, int cvq, bool force);
 
 int vhost_net_start(VirtIODevice *dev, NetClientState *ncs,
                     int data_queue_pairs, int cvq)
@@ -507,6 +527,18 @@ err:
 void vhost_net_stop(VirtIODevice *dev, NetClientState *ncs,
                     int data_queue_pairs, int cvq)
 {
+    vhost_net_stop_common(dev, ncs, data_queue_pairs, cvq, false);
+}
+
+void vhost_net_stop_force(VirtIODevice *dev, NetClientState *ncs,
+                          int data_queue_pairs, int cvq)
+{
+    vhost_net_stop_common(dev, ncs, data_queue_pairs, cvq, true);
+}
+
+static void vhost_net_stop_common(VirtIODevice *dev, NetClientState *ncs,
+                                  int data_queue_pairs, int cvq, bool force)
+{
     BusState *qbus = BUS(qdev_get_parent_bus(DEVICE(dev)));
     VirtioBusState *vbus = VIRTIO_BUS(qbus);
     VirtioBusClass *k = VIRTIO_BUS_GET_CLASS(vbus);
@@ -522,7 +554,11 @@ void vhost_net_stop(VirtIODevice *dev, NetClientState *ncs,
         } else {
             peer = qemu_get_peer(ncs, n->max_queue_pairs);
         }
-        vhost_net_stop_one(get_vhost_net(peer), dev);
+        if (force) {
+            vhost_net_stop_one_force(get_vhost_net(peer), dev);
+        } else {
+            vhost_net_stop_one(get_vhost_net(peer), dev);
+        }
     }
 
     r = k->set_guest_notifiers(qbus->parent, total_notifiers, false);
