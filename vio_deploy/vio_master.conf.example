@@ -1,0 +1,34 @@
+# qemu-VIO startup config.
+# Copy this file to vio_master.conf and edit paths for the target machine.
+
+# QEMU binary
+VIO_QEMU=/home/zyj/qemu-VIO/build/qemu-system-aarch64
+
+# VM resources and boot files
+VM_IMAGE=/home/zyj/ubuntu-arm64/test-vdpa.qcow2
+BIOS=/usr/share/edk2/aarch64/QEMU_EFI.fd
+VM_MEM=4096
+VM_SMP=4
+TASKSET_CPUS=4,5,6,7
+
+# vDPA and virtio-net
+VHOSTDEV=/dev/vhost-vdpa-0
+VIO_VDPA_DEV=vdpa0
+QUEUES=4
+VM_MAC=52:54:00:cb:45:11
+
+# Logs
+QEMU_LOG=./logs/qemu-vio.log
+CONSOLE_LOG=./logs/qemu-console.log
+
+# VIO threshold parameters
+VIO_HIGH_IOPS=100000
+VIO_LOW_IOPS=20000
+VIO_WINDOW_NS=1000000000
+VIO_COOLDOWN_NS=3000000000
+VIO_PASSTHROUGH_MIN_NS=10000000000
+VIO_PASSTHROUGH_WARMUP_WINDOWS=2
+VIO_LOW_WINDOWS=5
+VIO_STATS_STABILIZE_WINDOWS=2
+VIO_DEBUG_STATS=0
+VIO_DEBUG_TOUCH=1
