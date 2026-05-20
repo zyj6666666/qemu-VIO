@@ -1633,6 +1633,18 @@ static bool virtio_vio_touch_debug_enabled(void)
     return enabled;
 }
 
+void virtio_vio_set_snoop_enabled(VirtIODevice *vdev, bool enabled)
+{
+    if (vdev) {
+        vdev->vio_snoop_enabled = enabled;
+    }
+}
+
+bool virtio_vio_snoop_enabled(VirtIODevice *vdev)
+{
+    return vdev && vdev->vio_snoop_enabled;
+}
+
 static void virtio_vio_touch_account(VirtQueue *vq, bool is_write,
                                      hwaddr len)
 {
@@ -1728,9 +1740,11 @@ static bool virtqueue_map_desc(VirtQueue *vq, VirtIODevice *vdev,
         iov[num_sg].iov_len = len;
         addr[num_sg] = pa;
 
-        virtio_dma_log_touch(vdev, is_write, addr[num_sg],
-                             iov[num_sg].iov_base, iov[num_sg].iov_len);
-        virtio_vio_touch_account(vq, is_write, iov[num_sg].iov_len);
+        if (virtio_vio_snoop_enabled(vdev)) {
+            virtio_dma_log_touch(vdev, is_write, addr[num_sg],
+                                 iov[num_sg].iov_base, iov[num_sg].iov_len);
+            virtio_vio_touch_account(vq, is_write, iov[num_sg].iov_len);
+        }
 
         sz -= len;
         pa += len;
@@ -1784,8 +1798,10 @@ static void virtqueue_map_iovec(VirtIODevice *vdev, struct iovec *sg,
             exit(1);
         }
 
-        virtio_dma_log_touch(vdev, is_write, addr[i],
-                             sg[i].iov_base, sg[i].iov_len);
+        if (virtio_vio_snoop_enabled(vdev)) {
+            virtio_dma_log_touch(vdev, is_write, addr[i],
+                                 sg[i].iov_base, sg[i].iov_len);
+        }
     }
 }
 

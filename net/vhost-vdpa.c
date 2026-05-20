@@ -230,6 +230,7 @@ static bool vio_vdpa_threshold_env_present(void)
            g_getenv("VIO_PASSTHROUGH_WARMUP_WINDOWS") ||
            g_getenv("VIO_LOW_WINDOWS") ||
            g_getenv("VIO_STATS_STABILIZE_WINDOWS") ||
+           g_getenv("VIO_BACKEND_SWITCH") ||
            g_getenv("VIO_VDPA_DEV");
 }
 
@@ -594,6 +595,8 @@ static void vio_vdpa_shared_init(VhostVDPAState *s, bool start_with_svq)
     shared->vio_threshold_enabled =
         vio_vdpa_getenv_bool("VIO_VDPA_THRESHOLD", threshold_default);
     shared->vio_svq_control_enabled = start_with_svq;
+    shared->vio_backend_switch_enabled =
+        start_with_svq && vio_vdpa_getenv_bool("VIO_BACKEND_SWITCH", false);
     shared->vio_switch_pending = false;
     shared->vio_mode = VIO_VDPA_MODE_SNOOP;
     shared->vio_iops_count = 0;
@@ -650,9 +653,11 @@ static void vio_vdpa_shared_init(VhostVDPAState *s, bool start_with_svq)
     shared->vio_sample_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
                                            vhost_vdpa_net_vio_timer_cb, s);
     qemu_log_mask(LOG_GUEST_ERROR,
-                  "VIO-VDPA: threshold=%d, svq_control=%d, initial_mode=%s\n",
+                  "VIO-VDPA: threshold=%d, svq_control=%d, "
+                  "backend_switch=%d, initial_mode=%s\n",
                   shared->vio_threshold_enabled,
                   shared->vio_svq_control_enabled,
+                  shared->vio_backend_switch_enabled,
                   shared->vio_mode == VIO_VDPA_MODE_SNOOP ?
                   "SNOOP" : "PASSTHROUGH");
 }
@@ -1272,15 +1277,18 @@ static void vhost_vdpa_net_vio_timer_cb(void *opaque)
                       "SNOOP" : "PASSTHROUGH",
                       shared->vio_vdpa_dev ? shared->vio_vdpa_dev : "(null)",
                       shared->vio_data_vqs, shared->vio_vdev);
-        if (shared->vio_svq_control_enabled) {
+        virtio_vio_set_snoop_enabled(
+            shared->vio_vdev, shared->vio_mode == VIO_VDPA_MODE_SNOOP);
+        if (shared->vio_backend_switch_enabled) {
             vhost_vdpa_net_log_global_enable(
                 s, shared->vio_mode == VIO_VDPA_MODE_SNOOP);
         } else {
             qemu_log_mask(LOG_GUEST_ERROR,
-                          "VIO-VDPA: stats-only mode, skip SVQ switch, "
-                          "logical_target=%s\n",
+                          "VIO-VDPA: keep SVQ state unchanged, "
+                          "logical_target=%s, snoop_touch=%d\n",
                           shared->vio_mode == VIO_VDPA_MODE_SNOOP ?
-                          "SNOOP" : "PASSTHROUGH");
+                          "SNOOP" : "PASSTHROUGH",
+                          shared->vio_mode == VIO_VDPA_MODE_SNOOP);
         }
         shared->vio_switch_pending = false;
         if (shared->vio_mode == VIO_VDPA_MODE_PASSTHROUGH) {
@@ -1298,8 +1306,27 @@ static void vhost_vdpa_net_vio_timer_cb(void *opaque)
         return;
     }
 
-    stats_sampled = vhost_vdpa_net_vio_sample_vdpa_stats(s, &iops,
-                                                         &stats_not_ready);
+    if (shared->vio_svq_control_enabled &&
+        !shared->vio_backend_switch_enabled &&
+        shared->vio_mode == VIO_VDPA_MODE_PASSTHROUGH) {
+        int64_t elapsed = now - shared->vio_window_start_ns;
+
+        if (elapsed <= 0) {
+            iops = 0;
+        } else {
+            iops = shared->vio_iops_count * 1000000000ULL / elapsed;
+        }
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "VIO-VDPA: SVQ passthrough sample, iops=%" PRIu64
+                      ", desc=%" PRIu64 ", elapsed=%" PRId64 "\n",
+                      iops, shared->vio_iops_count, elapsed);
+        shared->vio_iops_count = 0;
+        shared->vio_window_start_ns = now;
+        stats_sampled = true;
+    } else {
+        stats_sampled = vhost_vdpa_net_vio_sample_vdpa_stats(s, &iops,
+                                                             &stats_not_ready);
+    }
     if (!stats_sampled && stats_not_ready) {
         timer_mod(shared->vio_sample_timer, now + shared->vio_window_ns);
         return;
@@ -1423,12 +1450,14 @@ static void vhost_vdpa_net_vio_timer_cb(void *opaque)
                       "iops=%" PRIu64 ", low_windows=%u/%u\n",
                       iops, shared->vio_low_windows_required,
                       shared->vio_low_windows_required);
-        if (shared->vio_svq_control_enabled) {
+        if (shared->vio_backend_switch_enabled) {
             vhost_vdpa_net_schedule_vio_switch(s);
         } else {
+            virtio_vio_set_snoop_enabled(shared->vio_vdev, true);
             qemu_log_mask(LOG_GUEST_ERROR,
                           "VIO-VDPA: logical switch PASSTHROUGH -> SNOOP, "
-                          "backend_path_unchanged=1, svq_control=0\n");
+                          "backend_path_unchanged=1, svq_kept_enabled=1, "
+                          "snoop_touch=1\n");
             timer_mod(shared->vio_sample_timer, now + shared->vio_window_ns);
         }
         return;
@@ -1451,8 +1480,7 @@ static void vhost_vdpa_net_schedule_vio_switch(VhostVDPAState *s)
     }
 
     shared->vio_switch_pending = true;
-    timer_mod(shared->vio_sample_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + shared->vio_window_ns);
+    timer_mod(shared->vio_sample_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME));
 }
 
 static void vhost_vdpa_net_data_svq_account(VhostShadowVirtqueue *svq,
@@ -1466,9 +1494,7 @@ static void vhost_vdpa_net_data_svq_account(VhostShadowVirtqueue *svq,
 
     (void)svq;
 
-    if (!shared->vio_threshold_enabled ||
-        !shared->vio_svq_control_enabled ||
-        shared->vio_mode != VIO_VDPA_MODE_SNOOP) {
+    if (!shared->vio_threshold_enabled || !shared->vio_svq_control_enabled) {
         return;
     }
 
@@ -1477,6 +1503,10 @@ static void vhost_vdpa_net_data_svq_account(VhostShadowVirtqueue *svq,
     shared->vio_iops_count++;
 
     if (elapsed < shared->vio_window_ns) {
+        return;
+    }
+
+    if (shared->vio_mode == VIO_VDPA_MODE_PASSTHROUGH) {
         return;
     }
 
@@ -1497,14 +1527,27 @@ static void vhost_vdpa_net_data_svq_account(VhostShadowVirtqueue *svq,
             shared->vio_stats_stabilize_windows;
         qemu_log_mask(LOG_GUEST_ERROR,
                       "VIO-VDPA: switch SNOOP -> PASSTHROUGH, "
-                      "iops=%" PRIu64 "\n", iops);
-        vhost_vdpa_net_schedule_vio_switch(s0);
+                      "iops=%" PRIu64 ", svq_kept_enabled=%d\n",
+                      iops, !shared->vio_backend_switch_enabled);
+        if (shared->vio_backend_switch_enabled) {
+            vhost_vdpa_net_schedule_vio_switch(s0);
+        } else {
+            virtio_vio_set_snoop_enabled(shared->vio_vdev, false);
+            vhost_vdpa_net_vio_begin_vdpa_sample(s0);
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "VIO-VDPA: logical switch SNOOP -> PASSTHROUGH, "
+                          "backend_path_unchanged=1, svq_kept_enabled=1, "
+                          "snoop_touch=0\n");
+            timer_mod(shared->vio_sample_timer, now + shared->vio_window_ns);
+        }
         return;
     }
 
     qemu_log_mask(LOG_GUEST_ERROR,
-                  "VIO-VDPA: stay SNOOP, iops=%" PRIu64
+                  "VIO-VDPA: stay %s, iops=%" PRIu64
                   ", low=%" PRIu64 ", high=%" PRIu64 "\n",
+                  shared->vio_mode == VIO_VDPA_MODE_SNOOP ?
+                  "SNOOP" : "PASSTHROUGH",
                   iops, shared->vio_low_iops, shared->vio_high_iops);
     shared->vio_iops_count = 0;
     shared->vio_window_start_ns = now;
@@ -1541,7 +1584,8 @@ static int vhost_vdpa_net_data_start(NetClientState *nc)
     assert(nc->info->type == NET_CLIENT_DRIVER_VHOST_VDPA);
 
     if (v->shared->vio_threshold_enabled &&
-        v->shared->vio_svq_control_enabled) {
+        v->shared->vio_svq_control_enabled &&
+        v->shared->vio_backend_switch_enabled) {
         v->shadow_vqs_enabled =
             migration_is_running() || v->shared->vio_mode == VIO_VDPA_MODE_SNOOP;
     } else if (s->always_svq || migration_is_running()) {
@@ -1554,6 +1598,11 @@ static int vhost_vdpa_net_data_start(NetClientState *nc)
         v->shared->vio_vdev = v->dev ? v->dev->vdev : NULL;
         v->shared->vio_data_vqs = vhost_vdpa_net_data_vqs(s);
         v->shared->shadow_data = v->shadow_vqs_enabled;
+        virtio_vio_set_snoop_enabled(
+            v->shared->vio_vdev,
+            v->shared->vio_threshold_enabled ?
+            v->shared->vio_mode == VIO_VDPA_MODE_SNOOP :
+            s->always_svq);
         if (v->shared->vio_threshold_enabled &&
             (!v->shared->vio_svq_control_enabled ||
              v->shared->vio_mode == VIO_VDPA_MODE_PASSTHROUGH) &&
@@ -2905,6 +2954,14 @@ static NetClientState *net_vhost_vdpa_init(NetClientState *peer,
                           "VIO-VDPA: stats-only threshold mode without SVQ; "
                           "IOPS comes from vDPA stats; SNOOP/PASSTHROUGH "
                           "are logical modes and the backend path is not "
+                          "restarted\n");
+        } else if (s->vhost_vdpa.shared->vio_threshold_enabled &&
+                   s->vhost_vdpa.shared->vio_svq_control_enabled &&
+                   !s->vhost_vdpa.shared->vio_backend_switch_enabled) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "VIO-VDPA: SVQ-always threshold mode; "
+                          "SNOOP/PASSTHROUGH switch only toggles snoop touch, "
+                          "shadow virtqueues stay enabled and vhost is not "
                           "restarted\n");
         }
     } else if (!is_datapath) {

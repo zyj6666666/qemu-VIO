@@ -168,6 +168,7 @@ struct VirtIODevice
      */
     EventNotifier config_notifier;
     bool device_iotlb_enabled;
+    bool vio_snoop_enabled;
 };
 
 struct VirtioDeviceClass {
@@ -279,6 +280,8 @@ void virtqueue_fill(VirtQueue *vq, const VirtQueueElement *elem,
                     unsigned int len, unsigned int idx);
 
 void virtqueue_map(VirtIODevice *vdev, VirtQueueElement *elem);
+void virtio_vio_set_snoop_enabled(VirtIODevice *vdev, bool enabled);
+bool virtio_vio_snoop_enabled(VirtIODevice *vdev);
 void *virtqueue_pop(VirtQueue *vq, size_t sz);
 unsigned int virtqueue_drop_all(VirtQueue *vq);
 void *qemu_get_virtqueue_element(VirtIODevice *vdev, QEMUFile *f, size_t sz);

@@ -85,6 +85,7 @@ typedef struct vhost_vdpa_shared {
 
     bool vio_threshold_enabled;
     bool vio_svq_control_enabled;
+    bool vio_backend_switch_enabled;
     bool vio_switch_pending;
     VioVdpaMode vio_mode;
     uint64_t vio_iops_count;
