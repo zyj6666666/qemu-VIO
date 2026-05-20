@@ -86,6 +86,8 @@ typedef struct vhost_vdpa_shared {
     bool vio_threshold_enabled;
     bool vio_svq_control_enabled;
     bool vio_backend_switch_enabled;
+    bool vio_guest_mem_released;
+    bool vio_guest_mem_restore_pending;
     bool vio_switch_pending;
     VioVdpaMode vio_mode;
     uint64_t vio_iops_count;
@@ -116,6 +118,8 @@ typedef struct vhost_vdpa_shared {
     bool vio_last_vdpa_desc_valid[VIRTIO_QUEUE_MAX];
     uint16_t vio_last_avail_idx[VIRTIO_QUEUE_MAX];
     bool vio_last_avail_valid[VIRTIO_QUEUE_MAX];
+    GHashTable *vio_svq_dma_refs;
+    GHashTable *vio_svq_elem_dma_keys;
 } VhostVDPAShared;
 
 typedef struct vhost_vdpa {
@@ -142,6 +146,12 @@ int vhost_vdpa_dma_map(VhostVDPAShared *s, uint32_t asid, hwaddr iova,
                        hwaddr size, void *vaddr, bool readonly);
 int vhost_vdpa_dma_unmap(VhostVDPAShared *s, uint32_t asid, hwaddr iova,
                          hwaddr size);
+int vhost_vdpa_vio_release_guest_memory(struct vhost_vdpa *v);
+int vhost_vdpa_vio_restore_guest_memory(struct vhost_vdpa *v);
+int vhost_vdpa_vio_svq_map_elem(struct vhost_vdpa *v, VirtQueueElement *elem);
+void vhost_vdpa_vio_svq_unmap_elem(struct vhost_vdpa *v,
+                                   VirtQueueElement *elem);
+void vhost_vdpa_vio_clear_svq_maps(struct vhost_vdpa *v);
 
 typedef struct vdpa_iommu {
     VhostVDPAShared *dev_shared;

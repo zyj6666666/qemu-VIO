@@ -148,6 +148,270 @@ int vhost_vdpa_dma_unmap(VhostVDPAShared *s, uint32_t asid, hwaddr iova,
     return ret;
 }
 
+typedef struct VioVdpaDmaRef {
+    DMAMap map;
+    unsigned int refs;
+} VioVdpaDmaRef;
+
+static void vhost_vdpa_vio_maps_init(VhostVDPAShared *s)
+{
+    if (!s->vio_svq_dma_refs) {
+        s->vio_svq_dma_refs = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                                     g_free, g_free);
+    }
+    if (!s->vio_svq_elem_dma_keys) {
+        s->vio_svq_elem_dma_keys =
+            g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL,
+                                  (GDestroyNotify)g_ptr_array_unref);
+    }
+}
+
+static char *vhost_vdpa_vio_dma_key(hwaddr gpa, hwaddr size)
+{
+    return g_strdup_printf("%016" PRIx64 ":%016" PRIx64,
+                           (uint64_t)gpa, (uint64_t)size);
+}
+
+int vhost_vdpa_vio_release_guest_memory(struct vhost_vdpa *v)
+{
+    VhostVDPAShared *s;
+
+    if (!v || !v->shared || !v->dev || !v->dev->vdev) {
+        return -EINVAL;
+    }
+
+    s = v->shared;
+    if (!v->shadow_vqs_enabled || !s->shadow_data) {
+        return -ENOTSUP;
+    }
+
+    vhost_vdpa_vio_maps_init(s);
+    s->vio_guest_mem_restore_pending = false;
+    if (s->vio_guest_mem_released) {
+        return 0;
+    }
+
+    if (s->listener_registered) {
+        memory_listener_unregister(&s->listener);
+        s->listener_registered = false;
+    }
+
+    ram_block_discard_disable(false);
+    s->vio_guest_mem_released = true;
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "VIO-VDPA: released guest memory mappings for SNOOP\n");
+    return 0;
+}
+
+int vhost_vdpa_vio_restore_guest_memory(struct vhost_vdpa *v)
+{
+    VhostVDPAShared *s;
+    int r;
+
+    if (!v || !v->shared || !v->dev || !v->dev->vdev) {
+        return -EINVAL;
+    }
+
+    s = v->shared;
+    if (!s->vio_guest_mem_released) {
+        s->vio_guest_mem_restore_pending = false;
+        return 0;
+    }
+
+    if (s->vio_svq_dma_refs && g_hash_table_size(s->vio_svq_dma_refs)) {
+        s->vio_guest_mem_restore_pending = true;
+        return -EAGAIN;
+    }
+
+    if (!s->listener_registered) {
+        r = ram_block_discard_disable(true);
+        if (r) {
+            error_report("Cannot re-enable RAM discard blocking: %s(%d)",
+                         g_strerror(-r), r);
+            return r;
+        }
+        memory_listener_register(&s->listener, v->dev->vdev->dma_as);
+        s->listener_registered = true;
+    }
+
+    s->vio_guest_mem_released = false;
+    s->vio_guest_mem_restore_pending = false;
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "VIO-VDPA: restored guest memory mappings for PASSTHROUGH\n");
+    return 0;
+}
+
+static int vhost_vdpa_vio_svq_map_sg(struct vhost_vdpa *v,
+                                     GPtrArray *elem_keys,
+                                     const struct iovec *sg, size_t num,
+                                     const hwaddr *gpas)
+{
+    VhostVDPAShared *s = v->shared;
+    hwaddr page_size = qemu_real_host_page_size();
+    int r;
+
+    if (!num) {
+        return 0;
+    }
+    if (!gpas) {
+        return -EINVAL;
+    }
+
+    for (size_t i = 0; i < num; i++) {
+        hwaddr gpa = gpas[i];
+        hwaddr gpa_start = QEMU_ALIGN_DOWN(gpa, page_size);
+        hwaddr gpa_end = QEMU_ALIGN_UP(gpa + sg[i].iov_len, page_size);
+        hwaddr page_gpa;
+
+        for (page_gpa = gpa_start; page_gpa < gpa_end;
+             page_gpa += page_size) {
+            char *key = vhost_vdpa_vio_dma_key(page_gpa, page_size);
+            uintptr_t vaddr = (uintptr_t)sg[i].iov_base;
+            VioVdpaDmaRef *ref =
+                g_hash_table_lookup(s->vio_svq_dma_refs, key);
+
+            if (ref) {
+                ref->refs++;
+                g_ptr_array_add(elem_keys, key);
+                continue;
+            }
+
+            ref = g_new0(VioVdpaDmaRef, 1);
+            ref->map.size = page_size - 1;
+            ref->map.perm = IOMMU_RW;
+            r = vhost_iova_tree_map_alloc_gpa(s->iova_tree, &ref->map,
+                                              page_gpa);
+            if (unlikely(r != IOVA_OK)) {
+                g_free(ref);
+                g_free(key);
+                return r;
+            }
+
+            if (page_gpa >= gpa) {
+                vaddr += page_gpa - gpa;
+            } else {
+                vaddr -= gpa - page_gpa;
+            }
+            r = vhost_vdpa_dma_map(s, v->address_space_id, ref->map.iova,
+                                   page_size, (void *)vaddr, false);
+            if (unlikely(r < 0)) {
+                vhost_iova_tree_remove_gpa(s->iova_tree, ref->map);
+                g_free(ref);
+                g_free(key);
+                return r;
+            }
+
+            ref->refs = 1;
+            g_hash_table_insert(s->vio_svq_dma_refs, g_strdup(key), ref);
+            g_ptr_array_add(elem_keys, key);
+        }
+    }
+
+    return 0;
+}
+
+int vhost_vdpa_vio_svq_map_elem(struct vhost_vdpa *v, VirtQueueElement *elem)
+{
+    VhostVDPAShared *s = v->shared;
+    GPtrArray *elem_keys;
+    int r;
+
+    if (!s->vio_guest_mem_released) {
+        return 0;
+    }
+
+    vhost_vdpa_vio_maps_init(s);
+    elem_keys = g_ptr_array_new_with_free_func(g_free);
+    g_hash_table_insert(s->vio_svq_elem_dma_keys, elem, elem_keys);
+
+    r = vhost_vdpa_vio_svq_map_sg(v, elem_keys, elem->out_sg, elem->out_num,
+                                  elem->out_addr);
+    if (unlikely(r < 0)) {
+        vhost_vdpa_vio_svq_unmap_elem(v, elem);
+        return r;
+    }
+
+    r = vhost_vdpa_vio_svq_map_sg(v, elem_keys, elem->in_sg, elem->in_num,
+                                  elem->in_addr);
+    if (unlikely(r < 0)) {
+        vhost_vdpa_vio_svq_unmap_elem(v, elem);
+        return r;
+    }
+
+    return 0;
+}
+
+void vhost_vdpa_vio_svq_unmap_elem(struct vhost_vdpa *v,
+                                   VirtQueueElement *elem)
+{
+    VhostVDPAShared *s;
+    GPtrArray *elem_keys;
+
+    if (!v || !v->shared || !elem) {
+        return;
+    }
+
+    s = v->shared;
+    if (!s->vio_svq_elem_dma_keys || !s->vio_svq_dma_refs) {
+        return;
+    }
+
+    elem_keys = g_hash_table_lookup(s->vio_svq_elem_dma_keys, elem);
+    if (!elem_keys) {
+        return;
+    }
+
+    for (size_t i = 0; i < elem_keys->len; i++) {
+        const char *key = g_ptr_array_index(elem_keys, i);
+        VioVdpaDmaRef *ref = g_hash_table_lookup(s->vio_svq_dma_refs, key);
+
+        if (!ref) {
+            continue;
+        }
+        if (--ref->refs) {
+            continue;
+        }
+
+        vhost_vdpa_dma_unmap(s, v->address_space_id, ref->map.iova,
+                             ref->map.size + 1);
+        vhost_iova_tree_remove_gpa(s->iova_tree, ref->map);
+        g_hash_table_remove(s->vio_svq_dma_refs, key);
+    }
+
+    g_hash_table_remove(s->vio_svq_elem_dma_keys, elem);
+    if (s->vio_guest_mem_restore_pending &&
+        g_hash_table_size(s->vio_svq_dma_refs) == 0) {
+        vhost_vdpa_vio_restore_guest_memory(v);
+    }
+}
+
+void vhost_vdpa_vio_clear_svq_maps(struct vhost_vdpa *v)
+{
+    VhostVDPAShared *s;
+    GHashTableIter iter;
+    gpointer value;
+
+    if (!v || !v->shared) {
+        return;
+    }
+
+    s = v->shared;
+    if (s->vio_svq_dma_refs) {
+        g_hash_table_iter_init(&iter, s->vio_svq_dma_refs);
+        while (g_hash_table_iter_next(&iter, NULL, &value)) {
+            VioVdpaDmaRef *ref = value;
+
+            vhost_vdpa_dma_unmap(s, v->address_space_id, ref->map.iova,
+                                 ref->map.size + 1);
+            vhost_iova_tree_remove_gpa(s->iova_tree, ref->map);
+        }
+    }
+
+    g_clear_pointer(&s->vio_svq_dma_refs, g_hash_table_destroy);
+    g_clear_pointer(&s->vio_svq_elem_dma_keys, g_hash_table_destroy);
+    s->vio_guest_mem_restore_pending = false;
+}
+
 static void vhost_vdpa_listener_begin_batch(VhostVDPAShared *s)
 {
     int fd = s->device_fd;
@@ -803,8 +1067,16 @@ static int vhost_vdpa_cleanup(struct vhost_dev *dev)
     v = dev->opaque;
     trace_vhost_vdpa_cleanup(dev, v);
     if (vhost_vdpa_first_dev(dev)) {
-        ram_block_discard_disable(false);
-        memory_listener_unregister(&v->shared->listener);
+        if (v->shared->listener_registered) {
+            memory_listener_unregister(&v->shared->listener);
+            v->shared->listener_registered = false;
+        }
+        if (!v->shared->vio_guest_mem_released) {
+            ram_block_discard_disable(false);
+        } else {
+            v->shared->vio_guest_mem_released = false;
+        }
+        vhost_vdpa_vio_clear_svq_maps(v);
     }
 
     vhost_vdpa_host_notifiers_uninit(dev, dev->nvqs);

@@ -774,6 +774,7 @@ static void vhost_vdpa_cleanup(NetClientState *nc)
         s->vhost_vdpa.shared->vio_sample_timer = NULL;
     }
     g_free(s->vhost_vdpa.shared->vio_vdpa_dev);
+    vhost_vdpa_vio_clear_svq_maps(&s->vhost_vdpa);
     qemu_close(s->vhost_vdpa.shared->device_fd);
     g_clear_pointer(&s->vhost_vdpa.shared->iova_tree, vhost_iova_tree_delete);
     g_free(s->vhost_vdpa.shared);
@@ -1283,6 +1284,11 @@ static void vhost_vdpa_net_vio_timer_cb(void *opaque)
             vhost_vdpa_net_log_global_enable(
                 s, shared->vio_mode == VIO_VDPA_MODE_SNOOP);
         } else {
+            if (shared->vio_mode == VIO_VDPA_MODE_SNOOP) {
+                vhost_vdpa_vio_release_guest_memory(&s->vhost_vdpa);
+            } else {
+                vhost_vdpa_vio_restore_guest_memory(&s->vhost_vdpa);
+            }
             qemu_log_mask(LOG_GUEST_ERROR,
                           "VIO-VDPA: keep SVQ state unchanged, "
                           "logical_target=%s, snoop_touch=%d\n",
@@ -1299,6 +1305,10 @@ static void vhost_vdpa_net_vio_timer_cb(void *opaque)
             timer_mod(shared->vio_sample_timer, now + shared->vio_window_ns);
         }
         return;
+    }
+
+    if (shared->vio_guest_mem_restore_pending) {
+        vhost_vdpa_vio_restore_guest_memory(&s->vhost_vdpa);
     }
 
     if (shared->vio_mode != VIO_VDPA_MODE_PASSTHROUGH &&
@@ -1453,6 +1463,7 @@ static void vhost_vdpa_net_vio_timer_cb(void *opaque)
         if (shared->vio_backend_switch_enabled) {
             vhost_vdpa_net_schedule_vio_switch(s);
         } else {
+            vhost_vdpa_vio_release_guest_memory(&s->vhost_vdpa);
             virtio_vio_set_snoop_enabled(shared->vio_vdev, true);
             qemu_log_mask(LOG_GUEST_ERROR,
                           "VIO-VDPA: logical switch PASSTHROUGH -> SNOOP, "
@@ -1498,6 +1509,12 @@ static void vhost_vdpa_net_data_svq_account(VhostShadowVirtqueue *svq,
         return;
     }
 
+    if (!shared->vio_backend_switch_enabled &&
+        shared->vio_mode == VIO_VDPA_MODE_SNOOP &&
+        !shared->vio_guest_mem_released) {
+        vhost_vdpa_vio_release_guest_memory(&s0->vhost_vdpa);
+    }
+
     now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     elapsed = now - shared->vio_window_start_ns;
     shared->vio_iops_count++;
@@ -1532,6 +1549,7 @@ static void vhost_vdpa_net_data_svq_account(VhostShadowVirtqueue *svq,
         if (shared->vio_backend_switch_enabled) {
             vhost_vdpa_net_schedule_vio_switch(s0);
         } else {
+            vhost_vdpa_vio_restore_guest_memory(&s0->vhost_vdpa);
             virtio_vio_set_snoop_enabled(shared->vio_vdev, false);
             vhost_vdpa_net_vio_begin_vdpa_sample(s0);
             qemu_log_mask(LOG_GUEST_ERROR,
@@ -1553,8 +1571,45 @@ static void vhost_vdpa_net_data_svq_account(VhostShadowVirtqueue *svq,
     shared->vio_window_start_ns = now;
 }
 
+static int vhost_vdpa_net_data_svq_handle(VhostShadowVirtqueue *svq,
+                                          VirtQueueElement *elem,
+                                          void *opaque)
+{
+    VhostVDPAState *s = opaque;
+    VhostVDPAShared *shared = s->vhost_vdpa.shared;
+    int r;
+
+    if (shared->vio_guest_mem_released) {
+        r = vhost_vdpa_vio_svq_map_elem(&s->vhost_vdpa, elem);
+        if (unlikely(r < 0)) {
+            return r;
+        }
+    }
+
+    r = vhost_svq_add(svq, elem->out_sg, elem->out_num, elem->out_addr,
+                      elem->in_sg, elem->in_num, elem->in_addr, elem);
+    if (unlikely(r != 0) && shared->vio_guest_mem_released) {
+        vhost_vdpa_vio_svq_unmap_elem(&s->vhost_vdpa, elem);
+    }
+
+    return r;
+}
+
+static void vhost_vdpa_net_data_svq_used(VhostShadowVirtqueue *svq,
+                                         VirtQueueElement *elem,
+                                         void *opaque)
+{
+    VhostVDPAState *s = opaque;
+
+    (void)svq;
+
+    vhost_vdpa_vio_svq_unmap_elem(&s->vhost_vdpa, elem);
+}
+
 static const VhostShadowVirtqueueOps vhost_vdpa_net_data_svq_ops = {
     .avail_account = vhost_vdpa_net_data_svq_account,
+    .avail_handler = vhost_vdpa_net_data_svq_handle,
+    .used_handler = vhost_vdpa_net_data_svq_used,
 };
 
 static int vdpa_net_migration_state_notifier(NotifierWithReturn *notifier,

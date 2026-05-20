@@ -448,6 +448,7 @@ static VirtQueueElement *vhost_svq_get_buf(VhostShadowVirtqueue *svq,
     const vring_used_t *used = svq->vring.used;
     vring_used_elem_t used_elem;
     uint16_t last_used, last_used_chain, num;
+    VirtQueueElement *elem;
 
     if (!vhost_svq_more_used(svq)) {
         return NULL;
@@ -481,7 +482,13 @@ static VirtQueueElement *vhost_svq_get_buf(VhostShadowVirtqueue *svq,
     svq->num_free += num;
 
     *len = used_elem.len;
-    return g_steal_pointer(&svq->desc_state[used_elem.id].elem);
+    elem = g_steal_pointer(&svq->desc_state[used_elem.id].elem);
+
+    if (svq->ops && svq->ops->used_handler && elem) {
+        svq->ops->used_handler(svq, elem, svq->ops_opaque);
+    }
+
+    return elem;
 }
 
 /**
